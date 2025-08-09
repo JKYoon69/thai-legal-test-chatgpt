@@ -12,51 +12,52 @@ from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 st.set_page_config(page_title="Thai Law Parser (Test)", layout="wide")
 st.title("📜 Thai Law Parser — Test")
 
-# =================== Global style (text-only tree, dark previews) ===================
+# =============== Global style ===============
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
 :root { --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }
 
-/* Raw text (dark) */
+/* 1) 모든 Streamlit 버튼을 "텍스트만"으로 보이게 (트리 라벨/토글용) */
+div.stButton > button {
+  background: transparent !important; border: none !important; box-shadow: none !important;
+  padding: 2px 0 !important; margin: 0 !important; border-radius: 0 !important;
+  color: #e6e6e6 !important; font-family: var(--thai-font); font-size: 0.98rem; text-align: left;
+}
+
+/* 2) Raw text (dark) */
 .rawbox { max-height: 420px; overflow-y: auto; padding: 10px;
   border: 1px solid #333; border-radius: 8px; background: #0e1117; }
 .raw { font-family: var(--thai-font); color:#e6e6e6; white-space: pre-wrap; margin: 0; }
 
-/* Tree: text-only (remove button chrome completely) */
+/* 3) Hierarchy: 텍스트 리스트 */
 .tree { max-height: 640px; overflow-y: auto; padding: 2px 4px; border-right: 1px solid #333; }
-.tree .row { display:flex; align-items:center; gap:6px; margin: 2px 0; }
-.tree .indent { width:0; }
-.tree .stButton > button {
-  background: transparent !important; border: none !important; box-shadow:none !important;
-  padding: 0 !important; margin: 0 !important; border-radius: 0 !important;
-  color: #e6e6e6 !important; font-family: var(--thai-font); font-size: 0.98rem; text-align:left;
-}
-.tree .chev .stButton > button { width: 20px; text-align:center; }
-.tree .label .stButton > button:hover { color:#ffe169 !important; }
+.tree .row { display:flex; align-items:center; gap:8px; margin: 4px 0; }
+.tree .arrow { width: 22px; text-align:center; color:#e6e6e6; }
+.tree .label { color:#e6e6e6; }
+.tree .label:hover { color:#ffe169; }
+.tree .indent { display:inline-block; }
 
-/* Full document: dark bg + white text; highlighted text in yellow/green */
+/* 4) Full document (dark bg + white text); highlight */
 .docbox { max-height: 640px; overflow-y: auto; padding: 12px;
   border: 1px solid #333; border-radius: 8px; background: #0e1117; width: 100%; }
 .doc { font-family: var(--thai-font); color:#e6e6e6; line-height:1.9; font-size:1.05rem;
   white-space: pre-wrap; word-break: normal; overflow-wrap: anywhere; margin:0; }
-.hlY { background:#3a3413; color:#ffe169; }  /* yellow */
-.hlG { background:#133a1a; color:#a7f3d0; }  /* green  */
 </style>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("**Flow:** Upload → Parse → Review → Download")
-    st.caption("UI v4 — pure-text tree, correct parent/child highlight, responsive doc")
+    st.caption("UI v5 — text-only tree, correct parent/child highlight, dark full-doc")
 
-# =================== Session ===================
+# =============== Session ===============
 ss = st.session_state
 ss.setdefault("raw_text", None)
 ss.setdefault("upload_sig", None)
 ss.setdefault("result", None)
 ss.setdefault("selected_node_id", None)
-ss.setdefault("expanded", {})  # node_id -> bool
-ss.setdefault("hl_color", "Yellow")      # highlight color selector
+ss.setdefault("expanded", {})      # node_id -> bool
+ss.setdefault("hl_color", "Yellow")
 
 def _file_sig(file):
     data = file.getbuffer()
@@ -80,12 +81,12 @@ if not ss.raw_text:
 
 raw_text = ss.raw_text
 
-# 1) Raw text (scrollable) — dark background
+# ---- Raw text (scrollable) on dark background ----
 with st.expander("Raw text (scrollable)", expanded=False):
     safe = (raw_text[:300000]).replace("<","&lt;").replace(">","&gt;")
     st.markdown(f"<div class='rawbox'><pre class='raw'>{safe}</pre></div>", unsafe_allow_html=True)
 
-# Controls (Run + Downloads near top)
+# ---- Controls ----
 auto_type = detect_doc_type(raw_text)
 st.write(f"🔎 Detected doc type: **{auto_type}**")
 forced_type = st.selectbox("Doc type (override if needed)",
@@ -94,7 +95,7 @@ if forced_type == "auto": forced_type = None
 
 run_col, dl_col = st.columns([1,2])
 with run_col:
-    run_clicked = st.button("🧩 Run parser", use_container_width=True)
+    run_clicked = st.button("🧩 Run parser (parse/refresh)", use_container_width=True)
 
 if run_clicked:
     with st.spinner("Parsing..."):
@@ -107,7 +108,7 @@ result: ParseResult|None = ss.result
 if not result:
     st.stop()
 
-# Downloads (fixed spot under Run)
+# ---- Downloads placed near the top ----
 with dl_col:
     out_dir = Path("out"); out_dir.mkdir(exist_ok=True)
     jsonl_nodes = out_dir / "nodes.jsonl"
@@ -143,15 +144,14 @@ with dl_col:
     with c4: st.download_button("🐞 debug.json", data=debug_json.read_bytes(),
                                 file_name="debug.json", mime="application/json", key="dl_debug")
 
-# Status
 st.success(f"Parsed: {len(result.nodes)} nodes, leaves {result.stats.get('leaf_count',0)}")
 issues = validate_tree(result)
 with st.expander(f"Consistency check (issues: {len(issues)})", expanded=False):
     st.write("No issues ✅" if not issues else "\n".join([f"[{i.level}] {i.message}" for i in issues]))
 
-# =================== Build flat/depth + parent map ===================
+# =============== Build flat + parent map ===============
 flat: list[dict] = []
-parents: dict[str, str|None] = {}  # node_id -> parent_id
+parents: dict[str, str|None] = {}
 def walk(n: Node, depth:int=0, parent_id:str|None=None):
     flat.append({"id": n.node_id, "label": n.label, "span": (n.span.start, n.span.end),
                  "depth": depth, "has_children": bool(n.children)})
@@ -160,101 +160,24 @@ def walk(n: Node, depth:int=0, parent_id:str|None=None):
 for root in result.root_nodes: walk(root, 0, None)
 by_id = {x["id"]: x for x in flat}
 
-# =================== Layout: Tree (text-only) + Full document ===================
+# =============== Layout ===============
 left, right = st.columns([1, 2], gap="large")
 
+# ---- LEFT: text-only expandable tree ----
 with left:
     st.subheader("Hierarchy")
-    st.caption("Expand/collapse with ▸ ▾. Click a node to highlight its range on the right.")
+    st.caption("Expand with ▸, collapse with ▾. Click a label to highlight its range on the right.")
     st.markdown("<div class='tree'>", unsafe_allow_html=True)
 
-    # recursive renderer (text-only)
     def render_node(node_id: str):
         item = by_id[node_id]
         depth = item["depth"]; has_children = item["has_children"]
-        indent_px = depth * 16  # slight indent for children
         expanded = ss.expanded.get(node_id, False)
         arrow = "▾" if expanded else ("▸" if has_children else "•")
 
-        # left chevron + label (no boxes; styled to plain text)
-        cols = st.columns([0.12, 0.88])
-        with cols[0]:
+        # 한 줄 구성: [arrow] [indent+label]
+        colA, colB = st.columns([0.1, 0.9])
+        with colA:
             if has_children:
                 if st.button(arrow, key=f"tg-{node_id}"):
-                    now = not expanded
-                    ss.expanded[node_id] = now
-                    # 접힌 순간: 부모 범위를 보이도록(요구사항) → 선택을 부모로 바꾸지 않아도
-                    # 아래 highlight 계산에서 접힌 조상을 우선 사용하므로 자동 반영됨.
-            else:
-                st.write(" ")
-        with cols[1]:
-            # label as plain text button
-            if st.button(item["label"], key=f"sel-{node_id}"):
-                ss.selected_node_id = node_id
-            # apply indent via spacer
-            st.markdown(f"<div style='height:0; margin-left:{indent_px}px'></div>", unsafe_allow_html=True)
-
-        # children (only if expanded)
-        if has_children and ss.expanded.get(node_id, False):
-            idx = flat.index(item) + 1
-            while idx < len(flat) and flat[idx]["depth"] > depth:
-                if flat[idx]["depth"] == depth + 1:
-                    render_node(flat[idx]["id"])
-                idx += 1
-
-    # render all roots
-    for r in [x for x in flat if x["depth"] == 0]:
-        render_node(r["id"])
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ---- Highlight target logic ----
-def compute_highlight_target(selected_id: str) -> str:
-    """If any ancestor is collapsed, highlight that ancestor; else highlight selected."""
-    target_id = selected_id
-    cur = selected_id
-    while True:
-        parent_id = parents.get(cur)
-        if parent_id is None:
-            break
-        if by_id[parent_id]["has_children"] and not ss.expanded.get(parent_id, False):
-            target_id = parent_id   # closest collapsed ancestor wins
-            break
-        cur = parent_id
-    return target_id
-
-# ---- RIGHT: Full document (dark, white text, highlighted selection) ----
-with right:
-    st.subheader("Full document (auto-scroll & highlight)")
-    ss.hl_color = st.radio("Highlight color", ["Yellow","Green"], horizontal=True, index=0)
-    sel_id = ss.selected_node_id or flat[0]["id"]
-    target_id = compute_highlight_target(sel_id)
-    target = next((n for n in result.nodes if n.node_id == target_id), None)
-
-    if target:
-        s, e = target.span.start, target.span.end
-        before = raw_text[:s].replace("<","&lt;").replace(">","&gt;")
-        body   = raw_text[s:e].replace("<","&lt;").replace(">","&gt;")
-        after  = raw_text[e:].replace("<","&lt;").replace(">","&gt;")
-        hl_cls = "hlY" if ss.hl_color == "Yellow" else "hlG"
-        html = f"""
-<div id="docbox" class="docbox" style="width:100%;">
-  <pre class="doc">{before}<a id="SEL"></a><span class="{hl_cls}">{body}</span>{after}</pre>
-</div>
-<script>
-  const sel = document.getElementById("SEL");
-  if (sel) sel.scrollIntoView({{block:'center'}});
-</script>
-"""
-        components.html(html, height=640, scrolling=False, width=0)  # width=0 -> container width(100%)
-    else:
-        st.info("Select a node on the left to preview.")
-
-# ---- Chunking controls ----
-st.divider()
-st.subheader("Chunking (for RAG)")
-mode = st.selectbox("Merge mode", ["article_only", "article±1"], index=1, key="merge_mode")
-chunks = make_chunks(raw_text, ss.result, mode=mode)
-st.write(f"Generated chunks: {len(chunks)}")
-with st.expander("Sample chunks (JSON)", expanded=False):
-    st.code(json.dumps([c.model_dump() for c in chunks[:5]], ensure_ascii=False, indent=2))
+                    ss.expanded[node_id] = not expanded
