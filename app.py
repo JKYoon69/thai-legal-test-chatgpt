@@ -12,42 +12,41 @@ from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 st.set_page_config(page_title="Thai Law Parser — Test", layout="wide")
 st.title("📜 Thai Law Parser — Test")
 
-# ---------- styles (scoped; 기본 버튼 스타일 유지) ----------
+# ---------- Safe, global styles ----------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
 :root { --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }
 
+/* Raw text */
 .rawbox { max-height: 420px; overflow-y:auto; padding:10px;
   border:1px solid #333; border-radius:8px; background:#0e1117; }
 .raw { font-family: var(--thai-font); color:#e6e6e6; white-space:pre-wrap; margin:0; }
 
-/* Hierarchy (arrow + pill label) */
-.hi-tree { max-height: 640px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }
-.hi-row { display:flex; align-items:center; gap:10px; margin:6px 0; }
-.hi-arrow .stButton>button {
-  width:28px; min-width:28px; height:28px; padding:0 0;
+/* Make buttons pill-like, but keep normal sizing so 레이아웃 안망가짐 */
+.stButton > button {
+  font-family: var(--thai-font); border-radius:9999px;
+  background:#1b1e23; border:1px solid #3a3a3a; color:#e6e6e6;
+  padding:6px 12px;
 }
-.hi-pill .stButton>button {
-  font-family: var(--thai-font);
-  padding:6px 12px; border-radius:9999px; border:1px solid #3a3a3a;
-  background:#1b1e23; color:#e6e6e6;
-}
-.hi-pill .stButton>button:hover { border-color:#6ea8fe; color:#dbe9ff; }
-.hi-indent { width: 0; }
+.stButton > button:hover { border-color:#6ea8fe; color:#dbe9ff; }
 
-/* Full document: take full width of its column */
+/* Left tree container */
+.hi-tree { max-height: 680px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }
+.hi-row { display:flex; align-items:center; gap:10px; margin:8px 0; }
+
+/* Full document */
 .docwrap { width:100%; }
-.docbox { max-height: 720px; overflow-y:auto; padding:16px;
+.docbox { max-height: 760px; overflow-y:auto; padding:16px;
   border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }
 .doc { font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif;
   color:#e6e6e6; line-height:1.95; font-size:1.06rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }
-.hlY { background:#3a3413; color:#ffe169; }
-.hlG { background:#133a1a; color:#a7f3d0; }
+.hlY { background:#3a3413; color:#ffe169; }  /* yellow */
+.hlG { background:#133a1a; color:#a7f3d0; }  /* green  */
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- session ----------
+# ---------- Session ----------
 ss = st.session_state
 ss.setdefault("raw_text", None)
 ss.setdefault("upload_sig", None)
@@ -100,7 +99,7 @@ result: ParseResult | None = ss.result
 if not result:
     st.stop()
 
-# ---- downloads (top fixed) ----
+# ---- Downloads ----
 with dl_col:
     out_dir = Path("out"); out_dir.mkdir(exist_ok=True)
     nodes_p = out_dir/"nodes.jsonl"
@@ -135,7 +134,7 @@ st.success(f"Parsed: {len(result.nodes)} nodes, leaves {result.stats.get('leaf_c
 with st.expander(f"Consistency check (issues: 0)", expanded=False):
     st.write("No issues ✅")
 
-# ---------- build flat tree ----------
+# ---------- Build flat tree ----------
 flat = []
 parents = {}
 def walk(n: Node, depth:int=0, parent:str|None=None):
@@ -147,8 +146,8 @@ def walk(n: Node, depth:int=0, parent:str|None=None):
 for r in result.root_nodes: walk(r, 0, None)
 by_id = {x["id"]:x for x in flat}
 
-# ---------- layout: widen right area ----------
-left, right = st.columns([1, 3.5], gap="large")  # 오른쪽 폭 넓힘
+# ---------- Layout (wider right) ----------
+left, right = st.columns([1, 3.5], gap="large")
 
 with left:
     st.subheader("Hierarchy")
@@ -163,17 +162,16 @@ with left:
 
         c1, c2 = st.columns([0.14, 0.86])
         with c1:
-            if has_children:
-                st.markdown("<div class='hi-row hi-arrow'>", unsafe_allow_html=True)
-                if st.button(arrow, key=f"tg-{node_id}"):
-                    ss.expanded[node_id] = not expanded
-                st.markdown("</div>", unsafe_allow_html=True)
-            else:
+            st.markdown("<div class='hi-row'>", unsafe_allow_html=True)
+            if has_children and st.button(arrow, key=f"tg-{node_id}"):
+                ss.expanded[node_id] = not expanded
+            elif not has_children:
                 st.write(" ")
+            st.markdown("</div>", unsafe_allow_html=True)
 
         with c2:
-            indent = " " * depth  # EM space for indent
-            st.markdown("<div class='hi-row hi-pill'>", unsafe_allow_html=True)
+            indent = " " * depth  # EM space indent
+            st.markdown("<div class='hi-row'>", unsafe_allow_html=True)
             if st.button(f"{indent}{item['label']}", key=f"sel-{node_id}"):
                 ss.selected_node_id = node_id
             st.markdown("</div>", unsafe_allow_html=True)
@@ -191,6 +189,7 @@ with left:
     st.markdown("</div>", unsafe_allow_html=True)
 
 def compute_target(selected_id: str) -> str:
+    # If any ancestor is collapsed, highlight that ancestor; else selected child.
     target = selected_id
     cur = selected_id
     while True:
@@ -203,7 +202,7 @@ def compute_target(selected_id: str) -> str:
 
 with right:
     st.subheader("Full document (auto-scroll & highlight)")
-    color = st.radio("Highlight color", ["Yellow","Green"], horizontal=True, index=1)  # 기본 Green
+    color = st.radio("Highlight color", ["Yellow","Green"], horizontal=True, index=1)
     sel = ss.selected_node_id or flat[0]["id"]
     target_id = compute_target(sel)
     node = next((n for n in result.nodes if n.node_id == target_id), None)
@@ -215,14 +214,13 @@ with right:
         after  = raw_text[e:].replace("<","&lt;").replace(">","&gt;")
         hl = "hlG" if color == "Green" else "hlY"
 
-        # iframe 내부에도 스타일 포함 + wrap 전체를 100%로
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8" />
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
 body {{ margin:0; background:#0e1117; }}
 .docwrap {{ width:100%; }}
-.docbox {{ max-height:720px; overflow-y:auto; padding:16px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
+.docbox {{ max-height:760px; overflow-y:auto; padding:16px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
 .doc {{ font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; color:#e6e6e6; line-height:1.95; font-size:1.06rem;
         white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }}
 .hlY {{ background:#3a3413; color:#ffe169; }}
@@ -236,8 +234,7 @@ body {{ margin:0; background:#0e1117; }}
 </div>
 <script> const el = document.getElementById("SEL"); if (el) el.scrollIntoView({{block:'center'}}); </script>
 </body></html>"""
-        # width=0 → column width(100%), docwrap/docbox도 100%로 설정
-        components.html(html, height=720, width=0, scrolling=False)
+        components.html(html, height=760, width=0, scrolling=False)
     else:
         st.info("Select a node on the left to preview.")
 
