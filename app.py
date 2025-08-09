@@ -11,9 +11,39 @@ from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 st.set_page_config(page_title="Thai Law Parser (Test)", layout="wide")
 st.title("📜 Thai Law Parser — Test")
 
+# ---- Global font/style (Thai-safe) ----
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
+:root { --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }
+.thai-box {
+  font-family: var(--thai-font);
+  line-height: 1.75;
+  font-size: 1rem;
+  color: #e6e6e6;
+  white-space: pre-wrap;
+  /* 줄바꿈 규칙: 조합문자 깨짐을 줄이기 위해 normal 유지, 너무 긴 줄은 anywhere로 */
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+.hl { background-color:#fff2a8; color:#111; }
+.box {
+  max-height: 480px; overflow-y: auto; padding: 8px;
+  border: 1px solid #ddd; border-radius: 6px; background: #0e1117;
+}
+.leftpane { max-height: 540px; overflow-y: auto; padding-right: 6px; }
+.node-btn {
+  width: 100%; text-align: left; padding: 6px 10px; border: 1px solid #444;
+  border-radius: 8px; background: #1e1e1e; color: #e6e6e6; margin: 4px 0;
+}
+.node-btn.sel { background: #2d3a4a; border-color:#5b8aaa; }
+.meta { color:#9aa0a6; font-size: 0.85rem; }
+</style>
+""", unsafe_allow_html=True)
+
 with st.sidebar:
     st.markdown("**Flow:** Upload → Parse → Review → Download")
-    st.caption("v0.6 — sibling fix, upload caching, stable UI state")
+    st.caption("v0.7 — optional 'ที่', Thai font, virtual scroll (Flat mode)")
 
 # ---- session state ----
 ss = st.session_state
@@ -22,12 +52,11 @@ ss.setdefault("upload_sig", None)        # hash to detect new uploads
 ss.setdefault("result", None)
 ss.setdefault("selected_node_id", None)
 ss.setdefault("expanded", {})            # node_id -> bool
+ss.setdefault("view_mode", "Flat")       # "Flat" | "Tree"
 
 def _file_sig(file):
     data = file.getbuffer()
-    h = hashlib.sha256()
-    # hashing whole buffer is fine for txt; still fast at few MB
-    h.update(data)
+    h = hashlib.sha256(); h.update(data)
     return h.hexdigest()
 
 uploaded = st.file_uploader("Upload Thai legal text (.txt)", type=["txt"], key="uploader")
@@ -43,23 +72,15 @@ if uploaded is not None:
         ss.selected_node_id = None
         ss.expanded = {}
     else:
-        # do NOT re-read/reset on reruns
         pass
 
 if ss.raw_text:
     raw_text = ss.raw_text
 
-    # Scrollable raw view (explicit text color for dark theme)
+    # Scrollable raw view with Thai font
     with st.expander("Raw text (scrollable)", expanded=False):
         safe = (raw_text[:300000]).replace("<", "&lt;").replace(">", "&gt;")
-        st.markdown(
-            f"""
-<div style="max-height: 420px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #0e1117;">
-<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">{safe}</pre>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"<div class='box'><pre class='thai-box'>{safe}</pre></div>", unsafe_allow_html=True)
 
     auto_type = detect_doc_type(raw_text)
     st.write(f"🔎 Detected doc type: **{auto_type}**")
@@ -79,7 +100,7 @@ if ss.raw_text:
             result = parse_document(raw_text, forced_type=forced_type)
             ss.result = result
             ss.selected_node_id = result.nodes[0].node_id if result.nodes else None
-            ss.expanded = {}  # reset expansion for fresh tree
+            ss.expanded = {}
 
     result: ParseResult | None = ss.result
     if result:
@@ -94,63 +115,81 @@ if ss.raw_text:
                 for i, iss in enumerate(issues, 1):
                     st.write(f"{i}. [{iss.level}] {iss.message}")
 
+        # build flat list for Flat-mode virtual scroll
+        flat: list[dict] = []
+        def walk(n: Node, depth:int=0):
+            flat.append({"id": n.node_id, "label": n.label, "span": (n.span.start, n.span.end), "depth": depth, "has_children": bool(n.children)})
+            for ch in n.children:
+                walk(ch, depth+1)
+        for root in result.root_nodes:
+            walk(root, 0)
+
         left, right = st.columns([1, 2], gap="large")
 
-        # ---- Collapsible, scroll-friendly hierarchy ----
         with left:
             st.subheader("Hierarchy (scroll & toggle)")
-            st.caption("Click a label to select; parents toggle open/close. Same-level stays aligned.")
+            ss.view_mode = st.radio("View mode", ["Flat", "Tree"], horizontal=True, index=0 if ss.view_mode=="Flat" else 1)
 
-            def render_tree(nodes: list[Node], depth: int = 0):
-                for node in nodes:
-                    pad_px = depth * 16
-                    label = node.label  # show as-is
+            if ss.view_mode == "Flat":
+                # --- Virtual scroll window around selected ---
+                sel_id = ss.selected_node_id or (flat[0]["id"] if flat else None)
+                idx = next((i for i,x in enumerate(flat) if x["id"]==sel_id), 0)
+                window = 30
+                start = max(0, idx - window//2)
+                end = min(len(flat), start + window)
+                st.caption(f"Showing {start+1}–{end} / {len(flat)}")
 
-                    # row container
-                    with st.container():
-                        cols = st.columns([0.2, 0.8])
-                        with cols[0]:
-                            if node.children:
-                                # expand/collapse; persist in session_state
-                                toggled = st.checkbox(
-                                    "", key=f"ex-{node.node_id}",
-                                    value=ss.expanded.get(node.node_id, False),
-                                    help="Expand/collapse",
-                                )
-                                ss.expanded[node.node_id] = toggled
-                            else:
-                                st.write("")
+                st.markdown("<div class='leftpane'>", unsafe_allow_html=True)
+                for i in range(start, end):
+                    item = flat[i]
+                    indent = "&nbsp;" * (item["depth"] * 4)
+                    sel_cls = " sel" if item["id"] == sel_id else ""
+                    # use form to avoid duplicate key issues on rerun
+                    with st.form(key=f"frm-{item['id']}"):
+                        st.markdown(f"{indent}<button class='node-btn{sel_cls}' type='submit'>{item['label']}</button>", unsafe_allow_html=True)
+                        submitted = st.form_submit_button("", use_container_width=False)
+                        if submitted:
+                            ss.selected_node_id = item["id"]
+                st.markdown("</div>", unsafe_allow_html=True)
 
-                        with cols[1]:
-                            if st.button(label, key=f"sel-{node.node_id}"):
-                                ss.selected_node_id = node.node_id
+            else:
+                # --- Tree mode with expand/collapse ---
+                st.caption("Click a label to select; parents toggle open/close.")
 
-                        # visual indent
-                        st.markdown(f"<div style='height:0; margin-left:{pad_px}px'></div>", unsafe_allow_html=True)
+                def render_tree(nodes: list[Node], depth: int = 0):
+                    for node in nodes:
+                        label = node.label
+                        has_children = bool(node.children)
+                        # toggle
+                        if has_children:
+                            toggled = st.checkbox("", key=f"ex-{node.node_id}",
+                                                  value=ss.expanded.get(node.node_id, False), help="Expand/collapse")
+                            ss.expanded[node.node_id] = toggled
+                        else:
+                            st.write("")
+                        # select
+                        if st.button(label, key=f"sel-{node.node_id}"):
+                            ss.selected_node_id = node.node_id
+                        # children
+                        if has_children and ss.expanded.get(node.node_id, False):
+                            render_tree(node.children, depth+1)
 
-                    if node.children and ss.expanded.get(node.node_id, False):
-                        render_tree(node.children, depth + 1)
-
-            render_tree(result.root_nodes, depth=0)
+                render_tree(result.root_nodes, depth=0)
 
         # ---- Highlighted preview ----
         with right:
             st.subheader("Highlighted preview (scrollable)")
-            sel_id = ss.selected_node_id or (result.nodes[0].node_id if result.nodes else None)
+            sel_id = ss.selected_node_id or (flat[0]["id"] if flat else None)
             target = next((n for n in result.nodes if n.node_id == sel_id), None)
             if target:
-                start, end = target.span.start, target.span.end
-                start_ctx = max(0, start - 200)
-                end_ctx = min(len(raw_text), end + 200)
-                prefix = raw_text[start_ctx:start]
-                body = raw_text[start:end]
-                suffix = raw_text[end:end_ctx]
+                s, e = target.span.start, target.span.end
+                s_ctx = max(0, s - 200); e_ctx = min(len(raw_text), e + 200)
+                pre = raw_text[s_ctx:s]; body = raw_text[s:e]; suf = raw_text[e:e_ctx]
+                pre = pre.replace("<","&lt;").replace(">","&gt;")
+                body = body.replace("<","&lt;").replace(">","&gt;")
+                suf = suf.replace("<","&lt;").replace(">","&gt;")
                 st.markdown(
-                    f"""
-<div style="max-height: 480px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #0e1117;">
-<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">…{prefix.replace('<','&lt;').replace('>','&gt;')}<mark style="background-color:#fff2a8; color:#111;">{body.replace('<','&lt;').replace('>','&gt;')}</mark>{suffix.replace('<','&lt;').replace('>','&gt;')}…</pre>
-</div>
-""",
+                    f"<div class='box'><pre class='thai-box'>…{pre}<span class='hl'>{body}</span>{suf}…</pre></div>",
                     unsafe_allow_html=True,
                 )
             else:
@@ -165,7 +204,7 @@ if ss.raw_text:
         with st.expander("Sample chunks (JSON)", expanded=False):
             st.code(json.dumps([c.model_dump() for c in chunks[:5]], ensure_ascii=False, indent=2))
 
-        # ---- Downloads (no reset; state persists) ----
+        # ---- Downloads (state persists) ----
         out_dir = Path("out"); out_dir.mkdir(exist_ok=True)
         jsonl_nodes = out_dir / "nodes.jsonl"
         jsonl_chunks = out_dir / "chunks.jsonl"
@@ -176,7 +215,7 @@ if ss.raw_text:
         to_jsonl(result.nodes, jsonl_nodes)
         to_jsonl(chunks, jsonl_chunks)
         preview_html.write_text(
-            "<html><meta charset='utf-8'><body>"
+            "<html><meta charset='utf-8'><body style=\"font-family:'Noto Sans Thai',sans-serif\">"
             "<h3>Thai Law Parser Preview</h3>"
             f"<pre>{json.dumps([n.model_dump() for n in result.nodes[:30]], ensure_ascii=False, indent=2)}</pre>"
             "</body></html>",

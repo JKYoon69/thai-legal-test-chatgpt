@@ -8,7 +8,7 @@ def normalize_text(s: str) -> str:
     # 기본 정규화: 태국숫자→아라비아, 개행 통일, 과도한 공백 정리
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = s.translate(THAI2ARABIC)
-    # '  ' -> ' ', 3줄 이상 연속 개행은 2줄로
+    # 불필요한 탭/연속 공백 정리 (태국어에는 단어 간 공백이 적으므로 과도하게 줄이지 않음)
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
@@ -22,16 +22,16 @@ LEVELS = {
     "unknown":     ["หมวด", "ส่วน", "บท", "มาตรา", "ข้อ"],
 }
 
-# ---- 핵심: 라인 시작 anchor 기반 헤더 패턴 ----
-# 문서 본문 중간의 'มาตรา 12 ตาม...' 참조를 배제하기 위해 ^로 고정
-# 번호는 아라비아만(사전 변환 덕분에 태국숫자 입력도 커버)
+# ---- 핵심: 라인 시작 anchor + 'ที่' 허용 ----
+# 예: "ภาคที่ 1", "ลักษณะที่ 2", "หมวด 3", "มาตรา 12", "ข้อ 5"
 RE_NUM = r"(?P<num>\d{1,4}(?:/\d{1,3})?)"
+# 상위 레벨들: 'ที่'가 있을 수도/없을 수도
 RE_HEADER = {
-    "ภาค":      re.compile(rf"(?m)^(?P<label>ภาค)\s*{RE_NUM}\b"),
-    "ลักษณะ":   re.compile(rf"(?m)^(?P<label>ลักษณะ)\s*{RE_NUM}\b"),
-    "หมวด":     re.compile(rf"(?m)^(?P<label>หมวด)\s*{RE_NUM}\b"),
-    "ส่วน":     re.compile(rf"(?m)^(?P<label>ส่วน)\s*{RE_NUM}\b"),
-    "บท":       re.compile(rf"(?m)^(?P<label>บท)\s*{RE_NUM}\b"),
+    "ภาค":      re.compile(rf"(?m)^(?P<label>ภาค)(?:ที่)?\s*{RE_NUM}\b"),
+    "ลักษณะ":   re.compile(rf"(?m)^(?P<label>ลักษณะ)(?:ที่)?\s*{RE_NUM}\b"),
+    "หมวด":     re.compile(rf"(?m)^(?P<label>หมวด)(?:ที่)?\s*{RE_NUM}\b"),
+    "ส่วน":     re.compile(rf"(?m)^(?P<label>ส่วน)(?:ที่)?\s*{RE_NUM}\b"),
+    "บท":       re.compile(rf"(?m)^(?P<label>บท)(?:ที่)?\s*{RE_NUM}\b"),
     "มาตรา":    re.compile(rf"(?m)^(?P<label>มาตรา)\s+{RE_NUM}\b"),
     "ข้อ":       re.compile(rf"(?m)^(?P<label>ข้อ)\s+{RE_NUM}\b"),
 }
