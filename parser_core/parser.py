@@ -20,7 +20,8 @@ def detect_doc_type(text: str) -> str:
 
 def _find_all_markers(text: str, doc_type: str) -> List[Tuple[int, int, str, str]]:
     """
-    줄 시작(anchor)에서만 레벨 토큰을 탐지하여 (start, end, level, label_with_num) 반환
+    Find level tokens only at line starts (anchors) to avoid false matches inside sentences.
+    Returns list of (start, end, level, label_with_num).
     """
     levels = R.LEVELS.get(doc_type, R.LEVELS["unknown"])
     markers = []
@@ -29,25 +30,25 @@ def _find_all_markers(text: str, doc_type: str) -> List[Tuple[int, int, str, str
         if not pat:
             continue
         for m in pat.finditer(text):
-            # 괄호 등으로 감싼 라인 제외: 예) "(มาตรา 12 ...)" 방지
+            # skip lines starting with brackets (e.g., "(มาตรา 12 ...)")
             line_start = text.rfind("\n", 0, m.start()) + 1
             if line_start >= 1 and line_start < m.start():
-                if text[line_start] in "([（":  # 다양한 괄호 앞머리
+                if text[line_start] in "([（":
                     continue
             start, end = m.span()
             num = m.group("num")
             markers.append((start, end, lv, f"{lv} {num}"))
 
-    # 부록류
+    # appendix-like tails
     for m in R.RE_APPENDIX.finditer(text):
         start, end = m.span()
         markers.append((start, end, "appendix", text[start:end].strip()))
 
     markers.sort(key=lambda x: x[0])
 
-    # 중복/너무 근접한 라벨 제거(실수 매칭 대비)
+    # dedupe very-close markers (defensive)
     deduped = []
-    last_pos = -999999
+    last_pos = -10**9
     for m in markers:
         if m[0] - last_pos < 3:
             continue
@@ -61,8 +62,28 @@ def parse_document(text: str, forced_type: str | None = None) -> ParseResult:
     doc_type = forced_type or detect_doc_type(norm)
 
     markers = _find_all_markers(norm, doc_type)
+
+    nodes: List[Node] = []
+    root_nodes: List[Node] = []
+
+    # If there is text before the first marker, create a 'prologue' node so we don't "lose" it.
+    if markers and markers[0][0] > 0:
+        pro_start = 0
+        pro_end = markers[0][0]
+        prologue = Node(
+            node_id="prologue-1",
+            level="prologue",
+            label="prologue",
+            num=None,
+            span=Span(start=pro_start, end=pro_end),
+            breadcrumbs=["prologue"],
+            children=[],
+        )
+        root_nodes.append(prologue)
+        nodes.append(prologue)
+
     if not markers:
-        # 헤더가 전혀 없으면 문서 전체를 루트 1개로
+        # no headers at all → the whole doc is a single node
         root = Node(
             node_id="document-1",
             level="document",
@@ -70,19 +91,20 @@ def parse_document(text: str, forced_type: str | None = None) -> ParseResult:
             num=None,
             span=Span(start=0, end=len(norm)),
             breadcrumbs=["document"],
-            children=[]
+            children=[],
         )
-        return ParseResult(doc_type=doc_type, nodes=[root], root_nodes=[root],
-                           stats={"node_count":1, "leaf_count":1})
+        return ParseResult(
+            doc_type=doc_type,
+            nodes=[root],
+            root_nodes=[root],
+            stats={"node_count": 1, "leaf_count": 1},
+        )
 
-    # 경계 계산
+    # compute boundaries for each marker
     boundaries = []
     for i, (s, e, lv, label) in enumerate(markers):
         next_start = markers[i + 1][0] if i + 1 < len(markers) else len(norm)
         boundaries.append((s, e, next_start, lv, label))
-
-    nodes: List[Node] = []
-    root_nodes: List[Node] = []
 
     level_order = {lv: i for i, lv in enumerate(R.LEVELS.get(doc_type, R.LEVELS["unknown"]))}
     stack: List[Node] = []
@@ -118,7 +140,7 @@ def parse_document(text: str, forced_type: str | None = None) -> ParseResult:
         _push(node)
         nodes.append(node)
 
-    # breadcrumbs 채우기
+    # fill breadcrumbs
     def fill_breadcrumbs(node: Node, trail: List[str]):
         node.breadcrumbs = trail + [f"{node.level} {node.num or node.label}"]
         for ch in node.children:
