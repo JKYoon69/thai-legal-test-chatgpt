@@ -246,4 +246,5 @@ st.subheader("Chunking (for RAG)")
 mode = st.selectbox("Merge mode", ["article_only","article±1"], index=1)
 chunks2 = make_chunks(raw_text, ss.result, mode=mode)
 st.write(f"Generated chunks: {len(chunks2)}")
-with st.expander("Sample chunks (JSON)", expanded=F
+with st.expander("Sample chunks (JSON)", expanded=False):
+    st.code(json.dumps([c.model_dump() for c in chunks2[:5]], ensure_ascii=False, indent=2))
