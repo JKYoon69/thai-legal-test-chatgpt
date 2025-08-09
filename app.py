@@ -12,7 +12,7 @@ from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 st.set_page_config(page_title="Thai Law Parser — Test", layout="wide")
 st.title("📜 Thai Law Parser — Test")
 
-# ---------- 최소한의 공통 스타일(전역 버튼 스타일 변경 없음!) ----------
+# ---------- styles (scoped; 기본 버튼 스타일 유지) ----------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
@@ -22,12 +22,32 @@ st.markdown("""
   border:1px solid #333; border-radius:8px; background:#0e1117; }
 .raw { font-family: var(--thai-font); color:#e6e6e6; white-space:pre-wrap; margin:0; }
 
-.docbox { max-height: 640px; overflow-y:auto; padding:12px;
-  border:1px solid #333; border-radius:8px; background:#0e1117; width:100%; }
+/* Hierarchy (arrow + pill label) */
+.hi-tree { max-height: 640px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }
+.hi-row { display:flex; align-items:center; gap:10px; margin:6px 0; }
+.hi-arrow .stButton>button {
+  width:28px; min-width:28px; height:28px; padding:0 0;
+}
+.hi-pill .stButton>button {
+  font-family: var(--thai-font);
+  padding:6px 12px; border-radius:9999px; border:1px solid #3a3a3a;
+  background:#1b1e23; color:#e6e6e6;
+}
+.hi-pill .stButton>button:hover { border-color:#6ea8fe; color:#dbe9ff; }
+.hi-indent { width: 0; }
+
+/* Full document: take full width of its column */
+.docwrap { width:100%; }
+.docbox { max-height: 720px; overflow-y:auto; padding:16px;
+  border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }
+.doc { font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif;
+  color:#e6e6e6; line-height:1.95; font-size:1.06rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }
+.hlY { background:#3a3413; color:#ffe169; }
+.hlG { background:#133a1a; color:#a7f3d0; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- 세션 ----------
+# ---------- session ----------
 ss = st.session_state
 ss.setdefault("raw_text", None)
 ss.setdefault("upload_sig", None)
@@ -80,7 +100,7 @@ result: ParseResult | None = ss.result
 if not result:
     st.stop()
 
-# ---- 다운로드 (늘 위에 고정) ----
+# ---- downloads (top fixed) ----
 with dl_col:
     out_dir = Path("out"); out_dir.mkdir(exist_ok=True)
     nodes_p = out_dir/"nodes.jsonl"
@@ -90,14 +110,14 @@ with dl_col:
     zip_p = out_dir/"bundle.zip"
 
     to_jsonl(result.nodes, nodes_p)
-    chunks = make_chunks(raw_text, result, mode="article±1")
-    to_jsonl(chunks, chunks_p)
+    chunks_default = make_chunks(raw_text, result, mode="article±1")
+    to_jsonl(chunks_default, chunks_p)
     preview_p.write_text(
         "<html><meta charset='utf-8'><body style=\"font-family:'Noto Sans Thai',sans-serif\">"
         f"<pre>{json.dumps([n.model_dump() for n in result.nodes[:30]], ensure_ascii=False, indent=2)}</pre>"
         "</body></html>", encoding="utf-8"
     )
-    debug_p.write_text(json.dumps(make_debug_report(raw_text, result, chunks), ensure_ascii=False, indent=2), encoding="utf-8")
+    debug_p.write_text(json.dumps(make_debug_report(raw_text, result, chunks_default), ensure_ascii=False, indent=2), encoding="utf-8")
     make_zip_bundle(zip_p, {
         "nodes.jsonl": nodes_p.read_bytes(),
         "chunks.jsonl": chunks_p.read_bytes(),
@@ -115,7 +135,7 @@ st.success(f"Parsed: {len(result.nodes)} nodes, leaves {result.stats.get('leaf_c
 with st.expander(f"Consistency check (issues: 0)", expanded=False):
     st.write("No issues ✅")
 
-# ---------- 트리 데이터 ----------
+# ---------- build flat tree ----------
 flat = []
 parents = {}
 def walk(n: Node, depth:int=0, parent:str|None=None):
@@ -127,12 +147,13 @@ def walk(n: Node, depth:int=0, parent:str|None=None):
 for r in result.root_nodes: walk(r, 0, None)
 by_id = {x["id"]:x for x in flat}
 
-# ---------- 레이아웃 ----------
-left, right = st.columns([1,2], gap="large")
+# ---------- layout: widen right area ----------
+left, right = st.columns([1, 3.5], gap="large")  # 오른쪽 폭 넓힘
 
 with left:
     st.subheader("Hierarchy")
     st.caption("Expand with ▸, collapse with ▾. Click a label to highlight its range on the right.")
+    st.markdown("<div class='hi-tree'>", unsafe_allow_html=True)
 
     def render_node(node_id: str):
         item = by_id[node_id]
@@ -140,30 +161,36 @@ with left:
         expanded = ss.expanded.get(node_id, False)
         arrow = "▾" if expanded else ("▸" if has_children else "•")
 
-        c1,c2 = st.columns([0.12, 0.88])
+        c1, c2 = st.columns([0.14, 0.86])
         with c1:
             if has_children:
+                st.markdown("<div class='hi-row hi-arrow'>", unsafe_allow_html=True)
                 if st.button(arrow, key=f"tg-{node_id}"):
                     ss.expanded[node_id] = not expanded
+                st.markdown("</div>", unsafe_allow_html=True)
             else:
                 st.write(" ")
+
         with c2:
-            label = (" " * (depth*4)) + item["label"]  # NBSP indent
-            if st.button(label, key=f"sel-{node_id}"):
+            indent = " " * depth  # EM space for indent
+            st.markdown("<div class='hi-row hi-pill'>", unsafe_allow_html=True)
+            if st.button(f"{indent}{item['label']}", key=f"sel-{node_id}"):
                 ss.selected_node_id = node_id
+            st.markdown("</div>", unsafe_allow_html=True)
 
         if has_children and ss.expanded.get(node_id, False):
-            idx = flat.index(item)+1
+            idx = flat.index(item) + 1
             while idx < len(flat) and flat[idx]["depth"] > depth:
-                if flat[idx]["depth"] == depth+1:
+                if flat[idx]["depth"] == depth + 1:
                     render_node(flat[idx]["id"])
                 idx += 1
 
-    for r in [x for x in flat if x["depth"]==0]:
+    for r in [x for x in flat if x["depth"] == 0]:
         render_node(r["id"])
 
+    st.markdown("</div>", unsafe_allow_html=True)
+
 def compute_target(selected_id: str) -> str:
-    # 접힌 조상이 있으면 그 조상을, 아니면 선택된 노드를 하이라이트
     target = selected_id
     cur = selected_id
     while True:
@@ -176,38 +203,47 @@ def compute_target(selected_id: str) -> str:
 
 with right:
     st.subheader("Full document (auto-scroll & highlight)")
-    color = st.radio("Highlight color", ["Yellow","Green"], horizontal=True, index=0)
+    color = st.radio("Highlight color", ["Yellow","Green"], horizontal=True, index=1)  # 기본 Green
     sel = ss.selected_node_id or flat[0]["id"]
     target_id = compute_target(sel)
     node = next((n for n in result.nodes if n.node_id == target_id), None)
+
     if node:
-        s,e = node.span.start, node.span.end
+        s, e = node.span.start, node.span.end
         before = raw_text[:s].replace("<","&lt;").replace(">","&gt;")
         body   = raw_text[s:e].replace("<","&lt;").replace(">","&gt;")
         after  = raw_text[e:].replace("<","&lt;").replace(">","&gt;")
-        hl_class = "hlY" if color=="Yellow" else "hlG"
-        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"/>
+        hl = "hlG" if color == "Green" else "hlY"
+
+        # iframe 내부에도 스타일 포함 + wrap 전체를 100%로
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8" />
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
-body{{margin:0;background:#0e1117;}}
-.docbox{{max-height:640px;overflow:auto;padding:12px;border:1px solid #333;border-radius:8px;background:#0e1117;width:100%;}}
-.doc{{font-family:'Noto Sans Thai',Tahoma,'Segoe UI',Arial,sans-serif;color:#e6e6e6;line-height:1.9;font-size:1.05rem;white-space:pre-wrap;overflow-wrap:anywhere;margin:0;}}
-.hlY{{background:#3a3413;color:#ffe169;}}
-.hlG{{background:#133a1a;color:#a7f3d0;}}
-</style></head><body>
-<div id="docbox" class="docbox">
-  <pre class="doc">{before}<a id="SEL"></a><span class="{hl_class}">{body}</span>{after}</pre>
+body {{ margin:0; background:#0e1117; }}
+.docwrap {{ width:100%; }}
+.docbox {{ max-height:720px; overflow-y:auto; padding:16px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
+.doc {{ font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; color:#e6e6e6; line-height:1.95; font-size:1.06rem;
+        white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }}
+.hlY {{ background:#3a3413; color:#ffe169; }}
+.hlG {{ background:#133a1a; color:#a7f3d0; }}
+</style></head>
+<body>
+<div class="docwrap">
+  <div id="docbox" class="docbox">
+    <pre class="doc">{before}<a id="SEL"></a><span class="{hl}">{body}</span>{after}</pre>
+  </div>
 </div>
-<script>document.getElementById("SEL").scrollIntoView({{block:'center'}})</script>
+<script> const el = document.getElementById("SEL"); if (el) el.scrollIntoView({{block:'center'}}); </script>
 </body></html>"""
-        components.html(html, height=640, width=0, scrolling=False)
+        # width=0 → column width(100%), docwrap/docbox도 100%로 설정
+        components.html(html, height=720, width=0, scrolling=False)
     else:
         st.info("Select a node on the left to preview.")
 
 st.divider()
 st.subheader("Chunking (for RAG)")
-m = st.selectbox("Merge mode", ["article_only","article±1"], index=1)
-chunks2 = make_chunks(raw_text, ss.result, mode=m)
+mode = st.selectbox("Merge mode", ["article_only","article±1"], index=1)
+chunks2 = make_chunks(raw_text, ss.result, mode=mode)
 st.write(f"Generated chunks: {len(chunks2)}")
-with st.expander("Sample chunks (JSON)", expanded=False):
-    st.code(json.dumps([c.model_dump() for c in chunks2[:5]], ensure_ascii=False, indent=2))
+with st.expander("Sample chunks (JSON)", expanded=F
