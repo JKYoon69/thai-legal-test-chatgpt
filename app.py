@@ -7,13 +7,13 @@ from parser_core.postprocess import validate_tree, make_chunks
 from parser_core.schema import ParseResult
 from exporters.writers import to_jsonl, make_zip_bundle
 
-
 st.set_page_config(page_title="Thai Law Parser (Test)", layout="wide")
 st.title("📜 Thai Law Parser — 테스트")
 
 with st.sidebar:
     st.markdown("**업로드 → 파싱 → 검토 → 다운로드** 순서로 진행하세요.")
     st.markdown("문서유형 감지 실패 시 수동으로 선택할 수 있어요.")
+    st.caption("v0.2 — line-anchored headers, spans-only nodes")
 
 uploaded = st.file_uploader("태국어 법률 문서 업로드 (.txt)", type=["txt"])
 
@@ -49,7 +49,9 @@ if st.session_state.raw_text:
 
     result: ParseResult|None = st.session_state.result
     if result:
-        st.success(f"파싱 완료: 노드 {len(result.nodes)}개, 조문(최하위) {result.stats.get('leaf_count', 0)}개")
+        st.success(
+            f"파싱 완료: 노드 {len(result.nodes)}개, 최하위 노드 {result.stats.get('leaf_count', 0)}개"
+        )
 
         # 검증 리포트
         issues = validate_tree(result)
@@ -65,9 +67,8 @@ if st.session_state.raw_text:
 
         with left:
             st.subheader("계층 트리")
-            # 간단한 트리 렌더링
             def render_node(node, depth=0):
-                pad = "　" * depth  # full-width space for neat align
+                pad = "　" * depth
                 label = f"{node.level} {node.label}".strip()
                 st.write(f"{pad}- **{label}**  (chars {node.span.start}–{node.span.end})")
                 for ch in node.children:
@@ -78,8 +79,6 @@ if st.session_state.raw_text:
 
         with right:
             st.subheader("원문 하이라이트")
-            # 간단: 특정 노드 선택해서 해당 영역만 표시
-            # 선택 리스트: (node_id → label)
             leaf_options = [(n.node_id, f"{n.level} {n.label}") for n in result.nodes]
             sel = st.selectbox("노드 선택(해당 부분 하이라이트)", leaf_options, index=0)
             sel_id = sel[0]
@@ -98,13 +97,13 @@ if st.session_state.raw_text:
         st.divider()
         st.subheader("청킹 (RAG 입력용)")
         mode = st.selectbox("병합 모드", ["article_only", "article±1"], index=1)
-        chunks = make_chunks(result, mode=mode)
+        chunks = make_chunks(raw_text, result, mode=mode)
         st.write(f"생성된 청크: {len(chunks)}개")
 
         with st.expander("청크 미리보기(JSON)", expanded=False):
             st.code(json.dumps([c.model_dump() for c in chunks[:5]], ensure_ascii=False, indent=2))
 
-        # 다운로드
+        # 다운로드 파일 생성 (nodes는 텍스트 제외라 매우 작습니다)
         out_dir = Path("out")
         out_dir.mkdir(exist_ok=True)
         jsonl_nodes = out_dir / "nodes.jsonl"
@@ -115,7 +114,6 @@ if st.session_state.raw_text:
         to_jsonl(result.nodes, jsonl_nodes)
         to_jsonl(chunks, jsonl_chunks)
 
-        # 간단 프리뷰 HTML 생성
         preview_html.write_text(
             "<html><meta charset='utf-8'><body>"
             "<h3>Thai Law Parser Preview</h3>"
