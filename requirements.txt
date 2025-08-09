@@ -1,3 +1,4 @@
 streamlit
 pydantic
 regex
+streamlit-extras==0.4.0

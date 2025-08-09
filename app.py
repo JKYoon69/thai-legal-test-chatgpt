@@ -1,10 +1,11 @@
-# app.py — Thai Law Parser (Cloud-safe UI, full width, text-only tree, fixed rerun)
+# app.py — Thai Law Parser (Cloud-safe UI, full width, scoped tree styles, fixed rerun)
 import hashlib
 import json
 from pathlib import Path
 import datetime as _dt
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_extras.stylable_container import stylable_container  # << 핵심
 
 # --- local modules (unchanged) ---
 from parser_core.parser import detect_doc_type, parse_document
@@ -12,21 +13,18 @@ from parser_core.postprocess import validate_tree, make_chunks
 from parser_core.schema import ParseResult, Node
 from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 
-BUILD_ID = "ui-fullwidth-texttree-v2 " + _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+BUILD_ID = "ui-fullwidth-scoped-v3 " + _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 st.set_page_config(page_title="Thai Law Parser — Test", layout="wide")
 st.title("📜 Thai Law Parser — Test")
 st.caption(f"Build: {BUILD_ID}")
 
-# ------------------- GLOBAL (SAFE) CSS -------------------
-# - .block-container 폭을 뷰포트 기준으로 확장: 우측 본문이 실제로 넓어짐
-# - 전역 버튼 스타일은 제거 (충돌 방지)
-# - 트리(.hi-tree) 안의 버튼만 '텍스트 링크'처럼 보이게 스코프 한정
+# ------------------- GLOBAL CSS (안전 범위) -------------------
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
 :root { --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }
 
-/* >>> PAGE width: use viewport width (Cloud-safe) */
+/* 페이지 전체 폭을 뷰포트 기준으로 확장 */
 .main .block-container {
   max-width: min(96vw, 1800px);
   padding-left: 2rem; padding-right: 2rem;
@@ -37,24 +35,9 @@ st.markdown("""
   border:1px solid #333; border-radius:8px; background:#0e1117; }
 .raw { font-family: var(--thai-font); color:#e6e6e6; white-space:pre-wrap; margin:0; }
 
-/* Left tree container */
-.hi-tree { max-height: 680px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }
-.hi-row  { display:flex; align-items:center; gap:10px; margin:8px 0; }
-
-/* >>> Make tree buttons look like plain text links (scoped to .hi-tree) */
-.hi-tree .stButton > button {
-  background: transparent !important;
-  border: none !important;
-  color: #e6e6e6 !important;
-  padding: 2px 4px !important;
-  font-family: var(--thai-font);
-  box-shadow: none !important;
-}
-.hi-tree .stButton > button:hover { text-decoration: underline; }
-
-/* Right full document */
+/* 우측 Full Document */
 .docwrap { width:100%; }
-.docbox { max-height: 800px; overflow-y:auto; padding:18px;
+.docbox { max-height: 820px; overflow-y:auto; padding:18px;
   border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }
 .doc { font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif;
   color:#e6e6e6; line-height:1.95; font-size:1.06rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }
@@ -63,7 +46,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ------------------- SIDEBAR: CACHE CONTROL -------------------
+# ------------------- SIDEBAR: CACHE -------------------
 with st.sidebar:
     st.markdown("**Utilities**")
     if st.button("♻️ Clear data/resource cache"):
@@ -72,7 +55,7 @@ with st.sidebar:
         try: st.cache_resource.clear()
         except Exception: pass
         st.success("Cleared cache. Rerunning…")
-        st.rerun()  # ✅ Cloud 최신 버전: experimental_rerun() 대신 rerun()
+        st.rerun()  # ✅ 최신 API
 
 # ------------------- SESSION -------------------
 ss = st.session_state
@@ -104,12 +87,12 @@ if not ss.raw_text:
 
 raw_text = ss.raw_text
 
-# ------------------- RAW TEXT BOX -------------------
+# ------------------- RAW TEXT -------------------
 with st.expander("Raw text (scrollable)", expanded=False):
     safe = raw_text[:300000].replace("<","&lt;").replace(">","&gt;")
     st.markdown(f"<div class='rawbox'><pre class='raw'>{safe}</pre></div>", unsafe_allow_html=True)
 
-# ------------------- PARSE CONTROLS -------------------
+# ------------------- PARSER -------------------
 auto_type = detect_doc_type(raw_text)
 st.write(f"🔎 Detected doc type: **{auto_type}**")
 dtype = st.selectbox("Doc type (override if needed)", ["auto","code","act","royal_decree","regulation"], index=0)
@@ -128,7 +111,7 @@ result: ParseResult | None = ss.result
 if not result:
     st.stop()
 
-# ------------------- DOWNLOADS (TOP) -------------------
+# ------------------- DOWNLOADS -------------------
 with dl_col:
     out_dir = Path("out"); out_dir.mkdir(exist_ok=True)
     nodes_p   = out_dir/"nodes.jsonl"
@@ -164,75 +147,72 @@ with dl_col:
 st.success(f"Parsed: {len(result.nodes)} nodes, leaves {result.stats.get('leaf_count',0)}")
 issues = validate_tree(result)
 with st.expander(f"Consistency check (issues: {len(issues)})", expanded=False):
-    if issues:
-        st.write("\n".join([f"[{i.level}] {i.message}" for i in issues]))
-    else:
-        st.write("No issues ✅")
+    st.write("No issues ✅" if not issues else "\n".join(f"[{i.level}] {i.message}" for i in issues))
 
-# ------------------- BUILD FLAT TREE -------------------
-flat = []
-parents = {}
+# ------------------- FLAT TREE -------------------
+flat, parents = [], {}
 def walk(n: Node, depth:int=0, parent:str|None=None):
     flat.append({"id": n.node_id, "label": n.label, "span": (n.span.start, n.span.end),
                  "depth": depth, "has_children": bool(n.children)})
     parents[n.node_id] = parent
-    for ch in n.children:
-        walk(ch, depth+1, n.node_id)
-for r in result.root_nodes:
-    walk(r, 0, None)
+    for ch in n.children: walk(ch, depth+1, n.node_id)
+for r in result.root_nodes: walk(r, 0, None)
 by_id = {x["id"]: x for x in flat}
 
 # ------------------- LAYOUT -------------------
-# 오른쪽을 더 넓게: [1, 5]
 left, right = st.columns([1, 5], gap="large")
 
 with left:
     st.subheader("Hierarchy ↪")
     st.caption("Expand with ▸, collapse with ▾. Click a label to highlight its range on the right.")
-    st.markdown("<div class='hi-tree'>", unsafe_allow_html=True)
 
-    def render_node(node_id: str):
-        item = by_id[node_id]
-        depth = item["depth"]; has_children = item["has_children"]
-        expanded = ss.expanded.get(node_id, False)
-        arrow = "▾" if expanded else ("▸" if has_children else "•")
+    # ✅ 트리 컨테이너를 stylable_container로 감싸서, 내부 버튼만 '텍스트'처럼 스타일링
+    with stylable_container(key="tree-scope", css_styles="""
+        .stButton > button {
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            padding: 2px 4px !important;
+            color: #e6e6e6 !important;
+            border-radius: 0 !important;
+        }
+        .stButton > button:hover { text-decoration: underline; }
+    """):
+        def render_node(node_id: str):
+            item = by_id[node_id]
+            depth = item["depth"]; has_children = item["has_children"]
+            expanded = ss.expanded.get(node_id, False)
+            arrow = "▾" if expanded else ("▸" if has_children else "•")
 
-        c1, c2 = st.columns([0.12, 0.88])
-        with c1:
-            st.markdown("<div class='hi-row'>", unsafe_allow_html=True)
-            if has_children and st.button(arrow, key=f"tg-{node_id}"):
-                ss.expanded[node_id] = not expanded
-            elif not has_children:
-                st.write(" ")
-            st.markdown("</div>", unsafe_allow_html=True)
+            c1, c2 = st.columns([0.12, 0.88])
+            with c1:
+                if has_children and st.button(arrow, key=f"tg-{node_id}"):
+                    ss.expanded[node_id] = not expanded
+                elif not has_children:
+                    st.write(" ")
+            with c2:
+                indent = " " * depth  # EM space 인덴트
+                if st.button(f"{indent}{item['label']}", key=f"sel-{node_id}"):
+                    ss.selected_node_id = node_id
 
-        with c2:
-            indent = " " * depth  # EM space
-            st.markdown("<div class='hi-row'>", unsafe_allow_html=True)
-            if st.button(f"{indent}{item['label']}", key=f"sel-{node_id}"):
-                ss.selected_node_id = node_id
-            st.markdown("</div>", unsafe_allow_html=True)
+            if has_children and ss.expanded.get(node_id, False):
+                idx = flat.index(item) + 1
+                while idx < len(flat) and flat[idx]["depth"] > depth:
+                    if flat[idx]["depth"] == depth + 1:
+                        render_node(flat[idx]["id"])
+                    idx += 1
 
-        if has_children and ss.expanded.get(node_id, False):
-            idx = flat.index(item) + 1
-            while idx < len(flat) and flat[idx]["depth"] > depth:
-                if flat[idx]["depth"] == depth + 1:
-                    render_node(flat[idx]["id"])
-                idx += 1
-
-    for r in [x for x in flat if x["depth"] == 0]:
-        render_node(r["id"])
-
-    st.markdown("</div>", unsafe_allow_html=True)
+        for r in [x for x in flat if x["depth"] == 0]:
+            render_node(r["id"])
 
 def compute_target(selected_id: str) -> str:
-    """If any ancestor is collapsed, highlight that ancestor; else selected child."""
+    # 부모가 접혀있으면 부모 범위를, 아니면 선택 노드 범위를 표시
     target = selected_id
     cur = selected_id
     while True:
         p = parents.get(cur)
         if p is None: break
-        if by_id[p]["has_children"] and not ss.expanded.get(p, False):
+        if by_id[p]["has_children"] and not st.session_state.expanded.get(p, False):
             target = p; break
         cur = p
     return target
@@ -251,14 +231,13 @@ with right:
         after  = raw_text[e:].replace("<","&lt;").replace(">","&gt;")
         hl_cls = "hlG" if color == "Green" else "hlY"
 
-        # iframe 내부 CSS 포함 (Cloud)
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8" />
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
 body {{ margin:0; background:#0e1117; }}
 .docwrap {{ width:100%; }}
-.docbox  {{ max-height:800px; overflow-y:auto; padding:18px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
+.docbox  {{ max-height:820px; overflow-y:auto; padding:18px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
 .doc     {{ font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; color:#e6e6e6; line-height:1.95; font-size:1.06rem;
             white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }}
 .hlY {{ background:#3a3413; color:#ffe169; }}
@@ -270,13 +249,13 @@ body {{ margin:0; background:#0e1117; }}
     <pre class="doc">{before}<a id="SEL"></a><span class="{hl_cls}">{body}</span>{after}</pre>
   </div>
 </div>
-<script> const el = document.getElementById("SEL"); if (el) el.scrollIntoView({{block:'center'}}); </script>
+<script> document.getElementById("SEL")?.scrollIntoView({{block:'center'}}); </script>
 </body></html>"""
-        components.html(html, height=820, width=0, scrolling=False)  # width=0 → 100% of right column
+        components.html(html, height=840, width=0, scrolling=False)  # width=0 → column 100%
     else:
         st.info("Select a node on the left to preview.")
 
-# ------------------- CHUNKING (RAG) -------------------
+# ------------------- CHUNKING -------------------
 st.divider()
 st.subheader("Chunking (for RAG)")
 mode = st.selectbox("Merge mode", ["article_only","article±1"], index=1)
