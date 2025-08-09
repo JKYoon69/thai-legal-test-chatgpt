@@ -1,4 +1,4 @@
-# app.py — Thai Law Parser (Streamlit Cloud–safe UI, wide container)
+# app.py — Thai Law Parser (Cloud-safe UI, full width, text-only tree, fixed rerun)
 import hashlib
 import json
 from pathlib import Path
@@ -6,58 +6,60 @@ import datetime as _dt
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ---- local modules (unchanged) ----
+# --- local modules (unchanged) ---
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import validate_tree, make_chunks
 from parser_core.schema import ParseResult, Node
 from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 
-# ------------------- APP META -------------------
-BUILD_ID = "ui-widen-100%-v1 " + _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+BUILD_ID = "ui-fullwidth-texttree-v2 " + _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 st.set_page_config(page_title="Thai Law Parser — Test", layout="wide")
 st.title("📜 Thai Law Parser — Test")
 st.caption(f"Build: {BUILD_ID}")
 
 # ------------------- GLOBAL (SAFE) CSS -------------------
-# - block-container max-width 확장: 페이지 전체 폭을 넓혀야 오른쪽 공백이 줄어듭니다.
-# - 버튼 모양은 최소한만(충돌 최소화), 트리 내부 추가 스타일은 .hi-tree 범위로 스코프.
-st.markdown(f"""
+# - .block-container 폭을 뷰포트 기준으로 확장: 우측 본문이 실제로 넓어짐
+# - 전역 버튼 스타일은 제거 (충돌 방지)
+# - 트리(.hi-tree) 안의 버튼만 '텍스트 링크'처럼 보이게 스코프 한정
+st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
-:root {{ --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }}
+:root { --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }
 
-/* >>> 페이지 전체 폭 확장 (중요) */
-.main .block-container {{
-  max-width: 1800px;   /* 기존 ~1200px 한계 해제 */
-  padding-left: 2rem;
-  padding-right: 2rem;
-}}
+/* >>> PAGE width: use viewport width (Cloud-safe) */
+.main .block-container {
+  max-width: min(96vw, 1800px);
+  padding-left: 2rem; padding-right: 2rem;
+}
 
-/* raw text */
-.rawbox {{ max-height: 420px; overflow-y:auto; padding:10px;
-  border:1px solid #333; border-radius:8px; background:#0e1117; }}
-.raw {{ font-family: var(--thai-font); color:#e6e6e6; white-space:pre-wrap; margin:0; }}
+/* Raw text */
+.rawbox { max-height: 420px; overflow-y:auto; padding:10px;
+  border:1px solid #333; border-radius:8px; background:#0e1117; }
+.raw { font-family: var(--thai-font); color:#e6e6e6; white-space:pre-wrap; margin:0; }
 
-/* 버튼 pill look — 최소 영향 */
-.stButton > button {{
+/* Left tree container */
+.hi-tree { max-height: 680px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }
+.hi-row  { display:flex; align-items:center; gap:10px; margin:8px 0; }
+
+/* >>> Make tree buttons look like plain text links (scoped to .hi-tree) */
+.hi-tree .stButton > button {
+  background: transparent !important;
+  border: none !important;
+  color: #e6e6e6 !important;
+  padding: 2px 4px !important;
   font-family: var(--thai-font);
-  border-radius: 9999px; background:#1b1e23; border:1px solid #3a3a3a; color:#e6e6e6;
-  padding:6px 12px;
-}}
-.stButton > button:hover {{ border-color:#6ea8fe; color:#dbe9ff; }}
+  box-shadow: none !important;
+}
+.hi-tree .stButton > button:hover { text-decoration: underline; }
 
-/* 트리(좌측) — 스코프 한정 */
-.hi-tree {{ max-height: 680px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }}
-.hi-row  {{ display:flex; align-items:center; gap:10px; margin:8px 0; }}
-
-/* 우측 Full Document 컨테이너 */
-.docwrap {{ width:100%; }}
-.docbox {{ max-height: 780px; overflow-y:auto; padding:18px;
-  border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
-.doc {{ font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif;
-  color:#e6e6e6; line-height:1.95; font-size:1.06rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }}
-.hlY {{ background:#3a3413; color:#ffe169; }}   /* yellow highlight */
-.hlG {{ background:#133a1a; color:#a7f3d0; }}   /* green highlight  */
+/* Right full document */
+.docwrap { width:100%; }
+.docbox { max-height: 800px; overflow-y:auto; padding:18px;
+  border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }
+.doc { font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif;
+  color:#e6e6e6; line-height:1.95; font-size:1.06rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }
+.hlY { background:#3a3413; color:#ffe169; }
+.hlG { background:#133a1a; color:#a7f3d0; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -70,7 +72,7 @@ with st.sidebar:
         try: st.cache_resource.clear()
         except Exception: pass
         st.success("Cleared cache. Rerunning…")
-        st.experimental_rerun()
+        st.rerun()  # ✅ Cloud 최신 버전: experimental_rerun() 대신 rerun()
 
 # ------------------- SESSION -------------------
 ss = st.session_state
@@ -174,16 +176,18 @@ def walk(n: Node, depth:int=0, parent:str|None=None):
     flat.append({"id": n.node_id, "label": n.label, "span": (n.span.start, n.span.end),
                  "depth": depth, "has_children": bool(n.children)})
     parents[n.node_id] = parent
-    for ch in n.children: walk(ch, depth+1, n.node_id)
-for r in result.root_nodes: walk(r, 0, None)
+    for ch in n.children:
+        walk(ch, depth+1, n.node_id)
+for r in result.root_nodes:
+    walk(r, 0, None)
 by_id = {x["id"]: x for x in flat}
 
 # ------------------- LAYOUT -------------------
-# 오른쪽 영역을 좀 더 넓게: [1, 4]
-left, right = st.columns([1, 4], gap="large")
+# 오른쪽을 더 넓게: [1, 5]
+left, right = st.columns([1, 5], gap="large")
 
 with left:
-    st.subheader("Hierarchy")
+    st.subheader("Hierarchy ↪")
     st.caption("Expand with ▸, collapse with ▾. Click a label to highlight its range on the right.")
     st.markdown("<div class='hi-tree'>", unsafe_allow_html=True)
 
@@ -193,7 +197,7 @@ with left:
         expanded = ss.expanded.get(node_id, False)
         arrow = "▾" if expanded else ("▸" if has_children else "•")
 
-        c1, c2 = st.columns([0.14, 0.86])
+        c1, c2 = st.columns([0.12, 0.88])
         with c1:
             st.markdown("<div class='hi-row'>", unsafe_allow_html=True)
             if has_children and st.button(arrow, key=f"tg-{node_id}"):
@@ -203,7 +207,7 @@ with left:
             st.markdown("</div>", unsafe_allow_html=True)
 
         with c2:
-            indent = " " * depth  # EM space indent
+            indent = " " * depth  # EM space
             st.markdown("<div class='hi-row'>", unsafe_allow_html=True)
             if st.button(f"{indent}{item['label']}", key=f"sel-{node_id}"):
                 ss.selected_node_id = node_id
@@ -247,14 +251,14 @@ with right:
         after  = raw_text[e:].replace("<","&lt;").replace(">","&gt;")
         hl_cls = "hlG" if color == "Green" else "hlY"
 
-        # iframe 안에 CSS를 포함 — Cloud에서도 확실히 반영
+        # iframe 내부 CSS 포함 (Cloud)
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8" />
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
 body {{ margin:0; background:#0e1117; }}
 .docwrap {{ width:100%; }}
-.docbox  {{ max-height:780px; overflow-y:auto; padding:18px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
+.docbox  {{ max-height:800px; overflow-y:auto; padding:18px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
 .doc     {{ font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; color:#e6e6e6; line-height:1.95; font-size:1.06rem;
             white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }}
 .hlY {{ background:#3a3413; color:#ffe169; }}
@@ -268,8 +272,7 @@ body {{ margin:0; background:#0e1117; }}
 </div>
 <script> const el = document.getElementById("SEL"); if (el) el.scrollIntoView({{block:'center'}}); </script>
 </body></html>"""
-        # width=0 → column width 100%; height 반드시 지정
-        components.html(html, height=780, width=0, scrolling=False)
+        components.html(html, height=820, width=0, scrolling=False)  # width=0 → 100% of right column
     else:
         st.info("Select a node on the left to preview.")
 
