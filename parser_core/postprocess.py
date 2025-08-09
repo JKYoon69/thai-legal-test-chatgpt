@@ -1,26 +1,47 @@
 from __future__ import annotations
-from typing import List
-from .schema import ParseResult, Issue, Chunk, Span
+from typing import List, Dict, Tuple
+from .schema import ParseResult, Issue, Chunk, Span, Node
+
+def _check_duplicates_scoped_by_parent(parent: Node, issues: List[Issue]):
+    """
+    Duplicate number check per parent scope.
+    E.g., 'มาตรา 1..' under the Act and 'มาตรา 1..' under the Code are NOT duplicates.
+    """
+    # group siblings by level
+    by_level: Dict[str, Dict[str, int]] = {}
+    for ch in parent.children:
+        if ch.num:
+            by_level.setdefault(ch.level, {})
+            key = ch.num
+            by_level[ch.level][key] = by_level[ch.level].get(key, 0) + 1
+
+    for level, counter in by_level.items():
+        for num, cnt in counter.items():
+            if cnt > 1:
+                issues.append(Issue(level="warn", message=f"Duplicate {level} number within same parent: {num} (x{cnt})"))
+
+    # recurse
+    for ch in parent.children:
+        _check_duplicates_scoped_by_parent(ch, issues)
 
 def validate_tree(result: ParseResult) -> List[Issue]:
     issues: List[Issue] = []
+    # basic span sanity
     for n in result.nodes:
         if n.span.start >= n.span.end:
-            issues.append(Issue(level="error", message=f"{n.node_id}: 빈 span"))
-    # 번호 중복 간단 체크(같은 레벨/번호가 연속 등장 시 경고)
-    seen = set()
-    for n in result.nodes:
-        if n.num:
-            key = (n.level, n.num)
-            if key in seen:
-                issues.append(Issue(level="warn", message=f"{n.level} 번호 중복: {n.num}"))
-            seen.add(key)
+            issues.append(Issue(level="error", message=f"{n.node_id}: empty span"))
+
+    # scoped duplicate check (parent-wise)
+    for root in result.root_nodes:
+        _check_duplicates_scoped_by_parent(root, issues)
+
     return issues
 
 def make_chunks(raw_text: str, result: ParseResult, mode: str = "article±1") -> List[Chunk]:
     """
-    article_only: 'มาตรา/ข้อ' 단위
-    article±1  : 이웃 조문과 얕게 병합
+    article_only: 'มาตรา/ข้อ' unit
+    article±1  : shallow-merge with neighbors
+    fallback   : leaf-based chunking if no article found
     """
     leaves = [n for n in result.nodes if not n.children]
     chunks: List[Chunk] = []
@@ -30,24 +51,23 @@ def make_chunks(raw_text: str, result: ParseResult, mode: str = "article±1") ->
 
     art_idxs = [i for i, n in enumerate(leaves) if is_article(n)]
     for idx in art_idxs:
-        if mode == "article_only":
-            chosen = [leaves[idx]]
-        else:
-            chosen = [x for x in leaves[max(0, idx - 1): idx + 2] if is_article(x)]
+        chosen = [leaves[idx]] if mode == "article_only" else \
+                 [x for x in leaves[max(0, idx - 1): idx + 2] if is_article(x)]
 
         start = min(c.span.start for c in chosen)
         end = max(c.span.end for c in chosen)
         text = raw_text[start:end]
 
-        chunk = Chunk(
-            chunk_id=f"chunk-{leaves[idx].node_id}",
-            node_ids=[c.node_id for c in chosen],
-            text=text.strip(),
-            breadcrumbs=leaves[idx].breadcrumbs,
-            span=Span(start=start, end=end),
-            meta={"mode": mode, "doc_type": result.doc_type},
+        chunks.append(
+            Chunk(
+                chunk_id=f"chunk-{leaves[idx].node_id}",
+                node_ids=[c.node_id for c in chosen],
+                text=text.strip(),
+                breadcrumbs=leaves[idx].breadcrumbs,
+                span=Span(start=start, end=end),
+                meta={"mode": mode, "doc_type": result.doc_type},
+            )
         )
-        chunks.append(chunk)
 
     if not chunks and leaves:
         for leaf in leaves:
