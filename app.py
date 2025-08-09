@@ -1,72 +1,78 @@
-# app.py — Thai Law Parser (Streamlit Cloud–safe UI)
+# app.py — Thai Law Parser (Streamlit Cloud–safe UI, wide container)
 import hashlib
 import json
 from pathlib import Path
+import datetime as _dt
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ---- your local modules (unchanged) ----
+# ---- local modules (unchanged) ----
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import validate_tree, make_chunks
 from parser_core.schema import ParseResult, Node
 from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 
-# ------------------- PAGE CONFIG -------------------
+# ------------------- APP META -------------------
+BUILD_ID = "ui-widen-100%-v1 " + _dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 st.set_page_config(page_title="Thai Law Parser — Test", layout="wide")
 st.title("📜 Thai Law Parser — Test")
+st.caption(f"Build: {BUILD_ID}")
 
 # ------------------- GLOBAL (SAFE) CSS -------------------
-# NOTE: don't style all .stButton globally except minimal pill look; tree-specific styles are scoped.
-st.markdown("""
+# - block-container max-width 확장: 페이지 전체 폭을 넓혀야 오른쪽 공백이 줄어듭니다.
+# - 버튼 모양은 최소한만(충돌 최소화), 트리 내부 추가 스타일은 .hi-tree 범위로 스코프.
+st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
-:root { --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }
+:root {{ --thai-font: 'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; }}
+
+/* >>> 페이지 전체 폭 확장 (중요) */
+.main .block-container {{
+  max-width: 1800px;   /* 기존 ~1200px 한계 해제 */
+  padding-left: 2rem;
+  padding-right: 2rem;
+}}
 
 /* raw text */
-.rawbox { max-height: 420px; overflow-y:auto; padding:10px;
-  border:1px solid #333; border-radius:8px; background:#0e1117; }
-.raw { font-family: var(--thai-font); color:#e6e6e6; white-space:pre-wrap; margin:0; }
+.rawbox {{ max-height: 420px; overflow-y:auto; padding:10px;
+  border:1px solid #333; border-radius:8px; background:#0e1117; }}
+.raw {{ font-family: var(--thai-font); color:#e6e6e6; white-space:pre-wrap; margin:0; }}
 
-/* gentle pill look for buttons (kept minimal to avoid layout issues on Cloud) */
-.stButton > button {
+/* 버튼 pill look — 최소 영향 */
+.stButton > button {{
   font-family: var(--thai-font);
   border-radius: 9999px; background:#1b1e23; border:1px solid #3a3a3a; color:#e6e6e6;
   padding:6px 12px;
-}
-.stButton > button:hover { border-color:#6ea8fe; color:#dbe9ff; }
+}}
+.stButton > button:hover {{ border-color:#6ea8fe; color:#dbe9ff; }}
 
-/* tree container (left) — we scope any extra styles inside .hi-tree to avoid global leaks */
-.hi-tree { max-height: 680px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }
-.hi-row  { display:flex; align-items:center; gap:10px; margin:8px 0; }
+/* 트리(좌측) — 스코프 한정 */
+.hi-tree {{ max-height: 680px; overflow-y:auto; padding:6px 4px; border-right:1px solid #333; }}
+.hi-row  {{ display:flex; align-items:center; gap:10px; margin:8px 0; }}
 
-/* full document (right) */
-.docwrap { width:100%; }
-.docbox { max-height: 760px; overflow-y:auto; padding:16px;
-  border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }
-.doc { font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif;
-  color:#e6e6e6; line-height:1.95; font-size:1.06rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }
-.hlY { background:#3a3413; color:#ffe169; }   /* yellow highlight */
-.hlG { background:#133a1a; color:#a7f3d0; }   /* green highlight  */
+/* 우측 Full Document 컨테이너 */
+.docwrap {{ width:100%; }}
+.docbox {{ max-height: 780px; overflow-y:auto; padding:18px;
+  border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
+.doc {{ font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif;
+  color:#e6e6e6; line-height:1.95; font-size:1.06rem; white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }}
+.hlY {{ background:#3a3413; color:#ffe169; }}   /* yellow highlight */
+.hlG {{ background:#133a1a; color:#a7f3d0; }}   /* green highlight  */
 </style>
 """, unsafe_allow_html=True)
 
-# ------------------- SIDEBAR: CACHE CONTROL (Cloud) -------------------
+# ------------------- SIDEBAR: CACHE CONTROL -------------------
 with st.sidebar:
     st.markdown("**Utilities**")
     if st.button("♻️ Clear data/resource cache"):
-        # Clear both modern caches; helpful on Streamlit Cloud when code/UI is iterated quickly
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        try:
-            st.cache_resource.clear()
-        except Exception:
-            pass
+        try: st.cache_data.clear()
+        except Exception: pass
+        try: st.cache_resource.clear()
+        except Exception: pass
         st.success("Cleared cache. Rerunning…")
         st.experimental_rerun()
 
-# ------------------- SESSION STATE -------------------
+# ------------------- SESSION -------------------
 ss = st.session_state
 ss.setdefault("raw_text", None)
 ss.setdefault("upload_sig", None)
@@ -168,16 +174,13 @@ def walk(n: Node, depth:int=0, parent:str|None=None):
     flat.append({"id": n.node_id, "label": n.label, "span": (n.span.start, n.span.end),
                  "depth": depth, "has_children": bool(n.children)})
     parents[n.node_id] = parent
-    for ch in n.children:
-        walk(ch, depth+1, n.node_id)
-
-for r in result.root_nodes:
-    walk(r, 0, None)
-
+    for ch in n.children: walk(ch, depth+1, n.node_id)
+for r in result.root_nodes: walk(r, 0, None)
 by_id = {x["id"]: x for x in flat}
 
 # ------------------- LAYOUT -------------------
-left, right = st.columns([1, 3.5], gap="large")  # widen right area for full doc
+# 오른쪽 영역을 좀 더 넓게: [1, 4]
+left, right = st.columns([1, 4], gap="large")
 
 with left:
     st.subheader("Hierarchy")
@@ -224,11 +227,9 @@ def compute_target(selected_id: str) -> str:
     cur = selected_id
     while True:
         p = parents.get(cur)
-        if p is None:
-            break
+        if p is None: break
         if by_id[p]["has_children"] and not ss.expanded.get(p, False):
-            target = p
-            break
+            target = p; break
         cur = p
     return target
 
@@ -246,14 +247,14 @@ with right:
         after  = raw_text[e:].replace("<","&lt;").replace(">","&gt;")
         hl_cls = "hlG" if color == "Green" else "hlY"
 
-        # IMPORTANT: CSS is included *inside* the iframe so Cloud doesn't strip styles.
+        # iframe 안에 CSS를 포함 — Cloud에서도 확실히 반영
         html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8" />
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;600&display=swap');
 body {{ margin:0; background:#0e1117; }}
 .docwrap {{ width:100%; }}
-.docbox  {{ max-height:760px; overflow-y:auto; padding:16px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
+.docbox  {{ max-height:780px; overflow-y:auto; padding:18px; border:1px solid #333; border-radius:10px; background:#0e1117; width:100%; }}
 .doc     {{ font-family:'Noto Sans Thai', Tahoma, 'Segoe UI', Arial, sans-serif; color:#e6e6e6; line-height:1.95; font-size:1.06rem;
             white-space:pre-wrap; overflow-wrap:anywhere; margin:0; }}
 .hlY {{ background:#3a3413; color:#ffe169; }}
@@ -267,8 +268,8 @@ body {{ margin:0; background:#0e1117; }}
 </div>
 <script> const el = document.getElementById("SEL"); if (el) el.scrollIntoView({{block:'center'}}); </script>
 </body></html>"""
-        # width=0 → take column width 100%; height must be explicit (iframe default is 150px).
-        components.html(html, height=760, width=0, scrolling=False)
+        # width=0 → column width 100%; height 반드시 지정
+        components.html(html, height=780, width=0, scrolling=False)
     else:
         st.info("Select a node on the left to preview.")
 
