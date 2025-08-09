@@ -12,31 +12,33 @@ st.title("📜 Thai Law Parser — Test")
 
 with st.sidebar:
     st.markdown("**Flow:** Upload → Parse → Review → Download")
-    st.caption("v0.4 — anchored headers, prologue, scoped-duplicate check, collapsible tree, debug report")
+    st.caption("v0.5 — unique node IDs, persistent selection/expand, readable raw text")
 
 uploaded = st.file_uploader("Upload Thai legal text (.txt)", type=["txt"])
 
-# session
-if "raw_text" not in st.session_state:
-    st.session_state.raw_text = None
-    st.session_state.result: ParseResult | None = None
-    st.session_state.selected_node_id: str | None = None
+# ---- session state ----
+ss = st.session_state
+ss.setdefault("raw_text", None)
+ss.setdefault("result", None)
+ss.setdefault("selected_node_id", None)
+ss.setdefault("expanded", {})  # node_id -> bool
 
 if uploaded:
     raw = uploaded.read().decode("utf-8", errors="ignore")
-    st.session_state.raw_text = raw
-    st.session_state.result = None
-    st.session_state.selected_node_id = None
+    ss.raw_text = raw
+    ss.result = None
+    ss.selected_node_id = None
+    ss.expanded = {}
 
-if st.session_state.raw_text:
-    raw_text = st.session_state.raw_text
+if ss.raw_text:
+    raw_text = ss.raw_text
 
-    # Scrollable raw view
+    # scrollable raw view with explicit text color
     with st.expander("Raw text (scrollable)", expanded=False):
         st.markdown(
             f"""
-<div style="max-height: 420px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #fafafa; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;">
-<pre style="white-space: pre-wrap; word-break: break-word; margin: 0;">{(raw_text[:300000]).replace('<','&lt;').replace('>','&gt;')}</pre>
+<div style="max-height: 420px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #0e1117;">
+<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">{(raw_text[:300000]).replace('<','&lt;').replace('>','&gt;')}</pre>
 </div>
 """,
             unsafe_allow_html=True,
@@ -57,15 +59,15 @@ if st.session_state.raw_text:
     if st.button("🧩 Run parser", use_container_width=True):
         with st.spinner("Parsing..."):
             result = parse_document(raw_text, forced_type=forced_type)
-            st.session_state.result = result
-            # default selection: first node
-            st.session_state.selected_node_id = result.nodes[0].node_id if result.nodes else None
+            ss.result = result
+            ss.selected_node_id = result.nodes[0].node_id if result.nodes else None
+            ss.expanded = {}  # reset expansion for fresh tree
 
-    result: ParseResult | None = st.session_state.result
+    result: ParseResult | None = ss.result
     if result:
         st.success(f"Parsed: {len(result.nodes)} nodes, leaves {result.stats.get('leaf_count', 0)}")
 
-        # Validation (now scoped by parent → no false duplicate for numbering restarts)
+        # Validation
         issues = validate_tree(result)
         with st.expander(f"Consistency check (issues: {len(issues)})", expanded=False):
             if not issues:
@@ -74,41 +76,57 @@ if st.session_state.raw_text:
                 for i, iss in enumerate(issues, 1):
                     st.write(f"{i}. [{iss.level}] {iss.message}")
 
-        # layout
         left, right = st.columns([1, 2], gap="large")
 
-        # ---- Hierarchy with collapsible expanders ----
+        # ---- Collapsible, scroll-friendly hierarchy ----
         with left:
             st.subheader("Hierarchy (scroll & toggle)")
-            st.caption("Click a node to highlight its full span on the right.")
+            st.caption("Click a label to select; parents toggle open/close. Same-level items stay aligned.")
 
-            def render_tree(node: Node, depth: int = 0):
-                # One-line label without runaway indentation for same-level peers
-                label = f"{node.level} {node.label}".strip()
+            # one-pass render using checkboxes for expand/collapse; keep same-level alignment by not nesting cards
+            # indent via padding-left; each node gets a unique key based on node_id
+            def render_tree(nodes: list[Node], depth: int = 0):
+                for node in nodes:
+                    pad_px = depth * 16
+                    label = node.label  # show as-is (avoid 'มาตรา มาตรา' duplication)
 
-                # expander for any node that has children
-                if node.children:
-                    exp = st.expander(label, expanded=False)
-                    with exp:
-                        # select button for parent → highlight full span
-                        if st.button(f"Select — {label}", key=f"sel-{node.node_id}"):
-                            st.session_state.selected_node_id = node.node_id
-                        # children
-                        for ch in node.children:
-                            render_tree(ch, depth + 1)
-                else:
-                    # leaf as simple button
-                    if st.button(label, key=f"sel-{node.node_id}"):
-                        st.session_state.selected_node_id = node.node_id
+                    # row container
+                    with st.container():
+                        cols = st.columns([1, 5])
+                        with cols[0]:
+                            # toggle only if has children
+                            if node.children:
+                                toggled = st.checkbox(
+                                    " ",
+                                    key=f"ex-{node.node_id}",
+                                    value=ss.expanded.get(node.node_id, False),
+                                    help="Expand/collapse",
+                                )
+                                ss.expanded[node.node_id] = toggled
+                            else:
+                                st.write("")
 
-            # Render each root; the column itself scrolls via page, but this keeps UI simple/stable.
-            for root in result.root_nodes:
-                render_tree(root)
+                        with cols[1]:
+                            # clickable label → select node (persist selection)
+                            if st.button(label, key=f"sel-{node.node_id}"):
+                                ss.selected_node_id = node.node_id
+
+                        # apply visual indent via HTML spacer
+                        st.markdown(
+                            f"<div style='height:0; margin-left:{pad_px}px'></div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # children
+                    if node.children and ss.expanded.get(node.node_id, False):
+                        render_tree(node.children, depth + 1)
+
+            render_tree(result.root_nodes, depth=0)
 
         # ---- Highlighted preview ----
         with right:
             st.subheader("Highlighted preview (scrollable)")
-            sel_id = st.session_state.selected_node_id or (result.nodes[0].node_id if result.nodes else None)
+            sel_id = ss.selected_node_id or (result.nodes[0].node_id if result.nodes else None)
             target = next((n for n in result.nodes if n.node_id == sel_id), None)
             if target:
                 start, end = target.span.start, target.span.end
@@ -119,8 +137,8 @@ if st.session_state.raw_text:
                 suffix = raw_text[end:end_ctx]
                 st.markdown(
                     f"""
-<div style="max-height: 480px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #ffffff;">
-<pre style="white-space: pre-wrap; word-break: break-word; margin: 0;">…{prefix.replace('<','&lt;').replace('>','&gt;')}<mark style="background-color:#fff2a8">{body.replace('<','&lt;').replace('>','&gt;')}</mark>{suffix.replace('<','&lt;').replace('>','&gt;')}…</pre>
+<div style="max-height: 480px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #0e1117;">
+<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">…{prefix.replace('<','&lt;').replace('>','&gt;')}<mark style="background-color:#fff2a8; color: #111;">{body.replace('<','&lt;').replace('>','&gt;')}</mark>{suffix.replace('<','&lt;').replace('>','&gt;')}…</pre>
 </div>
 """,
                     unsafe_allow_html=True,
@@ -138,8 +156,7 @@ if st.session_state.raw_text:
             st.code(json.dumps([c.model_dump() for c in chunks[:5]], ensure_ascii=False, indent=2))
 
         # ---- Downloads ----
-        out_dir = Path("out")
-        out_dir.mkdir(exist_ok=True)
+        out_dir = Path("out"); out_dir.mkdir(exist_ok=True)
         jsonl_nodes = out_dir / "nodes.jsonl"
         jsonl_chunks = out_dir / "chunks.jsonl"
         preview_html = out_dir / "preview.html"
@@ -155,6 +172,7 @@ if st.session_state.raw_text:
             "</body></html>",
             encoding="utf-8",
         )
+        from exporters.writers import make_debug_report
         debug_report = make_debug_report(raw_text, result, chunks)
         debug_json.write_text(json.dumps(debug_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
