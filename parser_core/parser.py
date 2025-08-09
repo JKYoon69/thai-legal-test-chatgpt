@@ -43,7 +43,7 @@ def _find_all_markers(text: str, doc_type: str) -> List[Tuple[int, int, str, str
 
     markers.sort(key=lambda x: x[0])
 
-    # dedupe very-close markers
+    # dedupe very-close markers (defensive)
     deduped = []
     last_pos = -10**9
     for m in markers:
@@ -63,7 +63,7 @@ def parse_document(text: str, forced_type: str | None = None) -> ParseResult:
     nodes: List[Node] = []
     root_nodes: List[Node] = []
 
-    # prologue
+    # prologue (raw text before first marker)
     if markers and markers[0][0] > 0:
         pro_start = 0
         pro_end = markers[0][0]
@@ -111,13 +111,12 @@ def parse_document(text: str, forced_type: str | None = None) -> ParseResult:
     for s, e, nxt, lv, label in boundaries:
         # rank: lower = higher level
         if lv == "appendix":
-            # appendix should not be nested under the last article
             stack.clear()
             lvl_rank = 10**6
         else:
             lvl_rank = level_order.get(lv, 10**5)
 
-        # ✅ siblings: pop while top_rank >= current_rank
+        # siblings: pop while top_rank >= current_rank
         while stack:
             top = stack[-1].level
             top_rank = 10**6 if top == "appendix" else level_order.get(top, 10**5)
@@ -140,6 +139,41 @@ def parse_document(text: str, forced_type: str | None = None) -> ParseResult:
         )
         _push(node)
         nodes.append(node)
+
+    # ---------- Heuristic: group leading articles under a virtual 'front_matter' ----------
+    # if before the first higher-level header we have many articles, wrap them.
+    higher_levels = {"ภาค", "ลักษณะ", "หมวด", "ส่วน", "บท"}
+    first_higher_idx = next((i for i, n in enumerate(root_nodes) if n.level in higher_levels), None)
+    if first_higher_idx is not None:
+        # collect leading nodes before first higher header that are article/section
+        leading_idxs = [i for i, n in enumerate(root_nodes[:first_higher_idx]) if n.level in ("มาตรา", "ข้อ")]
+        if leading_idxs:
+            count = len(leading_idxs)
+            first_article = root_nodes[leading_idxs[0]]
+            first_higher = root_nodes[first_higher_idx]
+            span_len = first_higher.span.start - first_article.span.start
+            if count >= 5 or span_len >= 2000:
+                # build virtual parent
+                parent = Node(
+                    node_id=f"front_matter-{first_article.span.start}",
+                    level="front_matter",
+                    label="front_matter",
+                    num=None,
+                    span=Span(start=first_article.span.start, end=first_higher.span.start),
+                    breadcrumbs=[],
+                    children=[],
+                )
+                # move targeted children under parent
+                moving = [root_nodes[i] for i in leading_idxs]
+                for _ in range(len(leading_idxs)):
+                    # remove from root in order from the end to keep indices valid
+                    root_nodes.pop(leading_idxs[-1])
+                    leading_idxs.pop()
+                # insert parent before first_higher_idx (which has shifted by number removed)
+                insert_pos = next((i for i, n in enumerate(root_nodes) if n is first_higher), len(root_nodes))
+                root_nodes.insert(insert_pos, parent)
+                parent.children.extend(moving)
+                nodes.append(parent)
 
     # breadcrumbs
     def fill_breadcrumbs(node: Node, trail: List[str]):
