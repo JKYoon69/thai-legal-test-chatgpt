@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 import streamlit as st
@@ -12,33 +13,49 @@ st.title("📜 Thai Law Parser — Test")
 
 with st.sidebar:
     st.markdown("**Flow:** Upload → Parse → Review → Download")
-    st.caption("v0.5 — unique node IDs, persistent selection/expand, readable raw text")
-
-uploaded = st.file_uploader("Upload Thai legal text (.txt)", type=["txt"])
+    st.caption("v0.6 — sibling fix, upload caching, stable UI state")
 
 # ---- session state ----
 ss = st.session_state
 ss.setdefault("raw_text", None)
+ss.setdefault("upload_sig", None)        # hash to detect new uploads
 ss.setdefault("result", None)
 ss.setdefault("selected_node_id", None)
-ss.setdefault("expanded", {})  # node_id -> bool
+ss.setdefault("expanded", {})            # node_id -> bool
 
-if uploaded:
-    raw = uploaded.read().decode("utf-8", errors="ignore")
-    ss.raw_text = raw
-    ss.result = None
-    ss.selected_node_id = None
-    ss.expanded = {}
+def _file_sig(file):
+    data = file.getbuffer()
+    h = hashlib.sha256()
+    # hashing whole buffer is fine for txt; still fast at few MB
+    h.update(data)
+    return h.hexdigest()
+
+uploaded = st.file_uploader("Upload Thai legal text (.txt)", type=["txt"], key="uploader")
+
+# Only reset when the uploaded file actually changed
+if uploaded is not None:
+    sig = _file_sig(uploaded)
+    if ss.upload_sig != sig:
+        raw = uploaded.read().decode("utf-8", errors="ignore")
+        ss.raw_text = raw
+        ss.upload_sig = sig
+        ss.result = None
+        ss.selected_node_id = None
+        ss.expanded = {}
+    else:
+        # do NOT re-read/reset on reruns
+        pass
 
 if ss.raw_text:
     raw_text = ss.raw_text
 
-    # scrollable raw view with explicit text color
+    # Scrollable raw view (explicit text color for dark theme)
     with st.expander("Raw text (scrollable)", expanded=False):
+        safe = (raw_text[:300000]).replace("<", "&lt;").replace(">", "&gt;")
         st.markdown(
             f"""
 <div style="max-height: 420px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #0e1117;">
-<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">{(raw_text[:300000]).replace('<','&lt;').replace('>','&gt;')}</pre>
+<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">{safe}</pre>
 </div>
 """,
             unsafe_allow_html=True,
@@ -52,11 +69,12 @@ if ss.raw_text:
         options=["auto", "code", "act", "royal_decree", "regulation"],
         index=0,
         help="If detection is wrong, select the right one.",
+        key="doc_type_select",
     )
     if forced_type == "auto":
         forced_type = None
 
-    if st.button("🧩 Run parser", use_container_width=True):
+    if st.button("🧩 Run parser", use_container_width=True, key="run_parser"):
         with st.spinner("Parsing..."):
             result = parse_document(raw_text, forced_type=forced_type)
             ss.result = result
@@ -81,24 +99,21 @@ if ss.raw_text:
         # ---- Collapsible, scroll-friendly hierarchy ----
         with left:
             st.subheader("Hierarchy (scroll & toggle)")
-            st.caption("Click a label to select; parents toggle open/close. Same-level items stay aligned.")
+            st.caption("Click a label to select; parents toggle open/close. Same-level stays aligned.")
 
-            # one-pass render using checkboxes for expand/collapse; keep same-level alignment by not nesting cards
-            # indent via padding-left; each node gets a unique key based on node_id
             def render_tree(nodes: list[Node], depth: int = 0):
                 for node in nodes:
                     pad_px = depth * 16
-                    label = node.label  # show as-is (avoid 'มาตรา มาตรา' duplication)
+                    label = node.label  # show as-is
 
                     # row container
                     with st.container():
-                        cols = st.columns([1, 5])
+                        cols = st.columns([0.2, 0.8])
                         with cols[0]:
-                            # toggle only if has children
                             if node.children:
+                                # expand/collapse; persist in session_state
                                 toggled = st.checkbox(
-                                    " ",
-                                    key=f"ex-{node.node_id}",
+                                    "", key=f"ex-{node.node_id}",
                                     value=ss.expanded.get(node.node_id, False),
                                     help="Expand/collapse",
                                 )
@@ -107,17 +122,12 @@ if ss.raw_text:
                                 st.write("")
 
                         with cols[1]:
-                            # clickable label → select node (persist selection)
                             if st.button(label, key=f"sel-{node.node_id}"):
                                 ss.selected_node_id = node.node_id
 
-                        # apply visual indent via HTML spacer
-                        st.markdown(
-                            f"<div style='height:0; margin-left:{pad_px}px'></div>",
-                            unsafe_allow_html=True,
-                        )
+                        # visual indent
+                        st.markdown(f"<div style='height:0; margin-left:{pad_px}px'></div>", unsafe_allow_html=True)
 
-                    # children
                     if node.children and ss.expanded.get(node.node_id, False):
                         render_tree(node.children, depth + 1)
 
@@ -138,7 +148,7 @@ if ss.raw_text:
                 st.markdown(
                     f"""
 <div style="max-height: 480px; overflow-y: auto; padding: 8px; border: 1px solid #ddd; border-radius: 6px; background: #0e1117;">
-<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">…{prefix.replace('<','&lt;').replace('>','&gt;')}<mark style="background-color:#fff2a8; color: #111;">{body.replace('<','&lt;').replace('>','&gt;')}</mark>{suffix.replace('<','&lt;').replace('>','&gt;')}…</pre>
+<pre style="white-space: pre-wrap; word-break: break-word; margin: 0; color: #e6e6e6;">…{prefix.replace('<','&lt;').replace('>','&gt;')}<mark style="background-color:#fff2a8; color:#111;">{body.replace('<','&lt;').replace('>','&gt;')}</mark>{suffix.replace('<','&lt;').replace('>','&gt;')}…</pre>
 </div>
 """,
                     unsafe_allow_html=True,
@@ -148,14 +158,14 @@ if ss.raw_text:
 
         st.divider()
         st.subheader("Chunking (for RAG)")
-        mode = st.selectbox("Merge mode", ["article_only", "article±1"], index=1)
+        mode = st.selectbox("Merge mode", ["article_only", "article±1"], index=1, key="merge_mode")
         chunks = make_chunks(raw_text, result, mode=mode)
         st.write(f"Generated chunks: {len(chunks)}")
 
         with st.expander("Sample chunks (JSON)", expanded=False):
             st.code(json.dumps([c.model_dump() for c in chunks[:5]], ensure_ascii=False, indent=2))
 
-        # ---- Downloads ----
+        # ---- Downloads (no reset; state persists) ----
         out_dir = Path("out"); out_dir.mkdir(exist_ok=True)
         jsonl_nodes = out_dir / "nodes.jsonl"
         jsonl_chunks = out_dir / "chunks.jsonl"
@@ -172,25 +182,21 @@ if ss.raw_text:
             "</body></html>",
             encoding="utf-8",
         )
-        from exporters.writers import make_debug_report
         debug_report = make_debug_report(raw_text, result, chunks)
         debug_json.write_text(json.dumps(debug_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        make_zip_bundle(
-            zip_path,
-            {
-                "nodes.jsonl": jsonl_nodes.read_bytes(),
-                "chunks.jsonl": jsonl_chunks.read_bytes(),
-                "preview.html": preview_html.read_bytes(),
-                "debug.json": debug_json.read_bytes(),
-            },
-        )
+        make_zip_bundle(zip_path, {
+            "nodes.jsonl": jsonl_nodes.read_bytes(),
+            "chunks.jsonl": jsonl_chunks.read_bytes(),
+            "preview.html": preview_html.read_bytes(),
+            "debug.json": debug_json.read_bytes(),
+        })
 
         st.download_button("⬇️ Download nodes.jsonl", data=jsonl_nodes.read_bytes(),
-                           file_name="nodes.jsonl", mime="application/jsonl")
+                           file_name="nodes.jsonl", mime="application/jsonl", key="dl_nodes")
         st.download_button("⬇️ Download chunks.jsonl", data=jsonl_chunks.read_bytes(),
-                           file_name="chunks.jsonl", mime="application/jsonl")
+                           file_name="chunks.jsonl", mime="application/jsonl", key="dl_chunks")
         st.download_button("⬇️ Download bundle.zip", data=zip_path.read_bytes(),
-                           file_name="thai-law-parser-bundle.zip", mime="application/zip")
+                           file_name="thai-law-parser-bundle.zip", mime="application/zip", key="dl_zip")
         st.download_button("🐞 Download debug.json", data=debug_json.read_bytes(),
-                           file_name="debug.json", mime="application/json")
+                           file_name="debug.json", mime="application/json", key="dl_debug")
