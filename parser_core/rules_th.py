@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Thai legal parsing rules (regex + normalizers)
+Thai legal parsing rules (regex + normalizers) — article-level tree hardened
 """
 import re
 
-# Thai-digit → ASCII-digit map
+# Thai-digit → ASCII-digit
 THAI_DIGITS = str.maketrans({
     "๐": "0", "๑": "1", "๒": "2", "๓": "3", "๔": "4",
     "๕": "5", "๖": "6", "๗": "7", "๘": "8", "๙": "9",
@@ -17,11 +17,12 @@ def remove_bom(text: str) -> str:
     return text.replace(BOM, "")
 
 def normalize_spaces(text: str) -> str:
-    # collapse weird spaces, ensure Windows/Mac newlines are normalized
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace(NBSP, " ")
-    # trim excessive empty lines (keep at most 2)
+    # normalize newlines & non-breaking spaces
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace(NBSP, " ")
+    # compress >2 blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
+    # strip trailing spaces
+    text = re.sub(r"[ \t]+\n", "\n", text)
     return text
 
 def normalize_thai_digits(text: str) -> str:
@@ -33,39 +34,39 @@ def normalize_text(text: str) -> str:
     text = normalize_thai_digits(text)
     return text
 
-# -------- Regex headers --------
-# number fragment
+# ---- Header regex ----------------------------------------------------------
+# Allow optional trailing dot & odd spaces after number
 RE_NUM = r"(?P<num>\d{1,4}(?:/\d{1,3})?)"
-
-# allow optional dot and odd spaces after number
 TAIL_NUM = r"(?:\s*\.?)"
 
-RE_HEADER = {
-    # major structural units (anchored at line start)
-    "ภาค": re.compile(rf"(?m)^(?P<label>ภาค)\s+{RE_NUM}{TAIL_NUM}\b"),
-    "ลักษณะ": re.compile(rf"(?m)^(?P<label>ลักษณะ)\s+{RE_NUM}{TAIL_NUM}\b"),
-    "หมวด": re.compile(rf"(?m)^(?P<label>หมวด)\s+{RE_NUM}{TAIL_NUM}\b"),
-    "ส่วน": re.compile(rf"(?m)^(?P<label>ส่วน)\s+{RE_NUM}{TAIL_NUM}\b"),
-    "บท": re.compile(rf"(?m)^(?P<label>บท)\s+{RE_NUM}{TAIL_NUM}\b"),
+# anchored at start-of-line; tolerate extra spaces/tabs/NBSP
+_ = r"[ \t" + NBSP + r"]+"
 
-    # frequently appearing named sections (no number)
+RE_HEADER = {
+    # major structural units
+    "ภาค": re.compile(rf"(?m)^(?P<label>ภาค){_}{RE_NUM}{TAIL_NUM}\b"),
+    "ลักษณะ": re.compile(rf"(?m)^(?P<label>ลักษณะ){_}{RE_NUM}{TAIL_NUM}\b"),
+    "หมวด": re.compile(rf"(?m)^(?P<label>หมวด){_}{RE_NUM}{TAIL_NUM}\b"),
+    "ส่วน": re.compile(rf"(?m)^(?P<label>ส่วน){_}{RE_NUM}{TAIL_NUM}\b"),
+    "บท": re.compile(rf"(?m)^(?P<label>บท){_}{RE_NUM}{TAIL_NUM}\b"),
+
+    # named sections without numbers
     "บทเฉพาะกาล": re.compile(rf"(?m)^(?P<label>บทเฉพาะกาล)\b"),
     "บทบัญญัติทั่วไป": re.compile(rf"(?m)^(?P<label>บทบัญญัติทั่วไป)\b"),
 
-    # article / section
-    # Note: tolerate extra spaces or NBSP between label and number; optional dot.
-    "มาตรา": re.compile(rf"(?m)^(?P<label>มาตรา)[ \t{NBSP}]+{RE_NUM}{TAIL_NUM}\b"),
-    "ข้อ": re.compile(rf"(?m)^(?P<label>ข้อ)[ \t{NBSP}]+{RE_NUM}{TAIL_NUM}\b"),
+    # article / item
+    "มาตรา": re.compile(rf"(?m)^(?P<label>มาตรา){_}{RE_NUM}{TAIL_NUM}\b"),
+    "ข้อ": re.compile(rf"(?m)^(?P<label>ข้อ){_}{RE_NUM}{TAIL_NUM}\b"),
 }
 
-# order of levels (lower index = higher in hierarchy)
+# hierarchy order (lower index = higher)
 LEVEL_ORDER = [
-    "front_matter",  # virtual
+    "front_matter",
     "ภาค",
     "ลักษณะ",
     "หมวด",
     "ส่วน",
-    "บท",  # also hosts บทเฉพาะกาล / บทบัญญัติทั่วไป (same level)
+    "บท",  # includes บทเฉพาะกาล / บทบัญญัติทั่วไป
     "มาตรา",
     "ข้อ",
 ]
