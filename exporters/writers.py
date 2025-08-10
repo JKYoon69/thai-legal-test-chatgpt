@@ -21,13 +21,28 @@ def to_jsonl(chunks: List[Chunk]) -> str:
         lines.append(json.dumps(obj, ensure_ascii=False))
     return "\n".join(lines)
 
+def _span_union_len(chunks: List[Chunk]) -> int:
+    ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
+    merged = []
+    for s, e in ivs:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    return sum(e - s for s, e in merged)
+
 def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_file: str, law_name: str) -> str:
+    span_union = _span_union_len(chunks)
+    src_len = len(parse_result.full_text)
+    coverage = (span_union / src_len) if src_len else 0.0
+
     rpt = {
         "source_file": source_file,
         "law_name": law_name,
         "doc_type": parse_result.doc_type,
         "node_count": len(parse_result.all_nodes),
         "chunk_count": len(chunks),
+        "coverage_span_union": round(coverage, 6),
         "sample_chunk": (chunks[0].text[:400] if chunks else ""),
         "timestamp": datetime.utcnow().isoformat() + "Z",
     }

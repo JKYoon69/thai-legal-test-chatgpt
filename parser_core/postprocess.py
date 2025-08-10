@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import List, Dict, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .schema import ParseResult, Node, Chunk
 from .rules_th import normalize_text
 
-# limits for safety; we keep article-only, but avoid absurd outliers
-MAX_NODE_CHARS = 4000     # 조문 텍스트가 이보다 길면 조문 내부에서 2~3개로만 안전 분할
-MIN_CHUNK_CHARS = 500     # 너무 짧은 경우 이웃과 합쳐 최소 길이 보장
+# 단계 1: 조문 단위 확보에 집중 — 분할/병합 비활성화(안전 상한만 넉넉히)
+MAX_NODE_CHARS = 10000  # 현 샘플의 최대 조문 3,382자 → 분할 발생하지 않도록 충분히 크게
 
 def validate_tree(result: ParseResult) -> List[str]:
     issues: List[str] = []
-    # 1) sibling span order
+
+    # 1) 형제 간 스팬이 겹치지 않는지 점검
     def _check(n: Node):
         for i, c in enumerate(n.children):
             if i + 1 < len(n.children):
@@ -21,7 +21,7 @@ def validate_tree(result: ParseResult) -> List[str]:
             _check(c)
     _check(result.root)
 
-    # 2) empty/ultra-short nodes (except front_matter)
+    # 2) 빈 노드 점검(front_matter 제외)
     for n in result.all_nodes:
         if n is result.root or n.label == "front_matter":
             continue
@@ -31,9 +31,7 @@ def validate_tree(result: ParseResult) -> List[str]:
     return issues
 
 def _is_leaf(n: Node) -> bool:
-    # treat มาตรา / ข้อ as leaves; if deeper levels exist, still consider article-level leaves
-    if n.children:
-        return False
+    # 조문/ข้อ를 리프 취급 (하위 노드가 있더라도 현재 단계에선 조문 단위만 청크로 삼음)
     return n.label in ("มาตรา", "ข้อ")
 
 def _gather_leaves(root: Node) -> List[Node]:
@@ -43,9 +41,10 @@ def _gather_leaves(root: Node) -> List[Node]:
         n = stack.pop(0)
         if _is_leaf(n):
             leaves.append(n)
+        # 계속 내려가되, 조문이 아닌 상위 노드는 탐색만
         for c in n.children:
             stack.append(c)
-    # SAFETY: sort by document order
+    # 문서 순서 보장
     leaves.sort(key=lambda x: x.span_start)
     return leaves
 
@@ -61,7 +60,7 @@ def _breadcrumbs(n: Node, result: ParseResult) -> List[str]:
 
 def guess_law_name(text: str) -> Optional[str]:
     """
-    Slightly stronger: get 1~2 consecutive lines near the top containing title tokens.
+    타이틀 라인 + 다음 보조 라인(있으면) 결합
     """
     norm = normalize_text(text)
     lines = [ln.strip() for ln in norm.splitlines()[:60] if ln.strip()]
@@ -69,29 +68,29 @@ def guess_law_name(text: str) -> Optional[str]:
     for i, ln in enumerate(lines):
         if ("พระราชบัญญัติ" in ln) or ("ประมวลกฎหมาย" in ln):
             title = ln
-            # if next line looks like subtitle/series, append
-            if i + 1 < len(lines) and len(lines[i + 1]) <= 60 and ("ภาค" in lines[i+1] or "ลักษณะ" in lines[i+1] or "พ.ศ." in lines[i+1] or "ฉบับ" in lines[i+1]):
+            if i + 1 < len(lines) and len(lines[i + 1]) <= 60 and (
+                "ภาค" in lines[i+1] or "ลักษณะ" in lines[i+1] or "พ.ศ." in lines[i+1] or "ฉบับ" in lines[i+1]
+            ):
                 title = f"{title} / {lines[i+1]}"
             break
     return title
 
 def _split_long_article(text: str, start: int, limit: int) -> List[Tuple[int, int]]:
     """
-    If article text is too long, split on paragraph breaks to keep <= limit.
-    Returns list of (s, e) offsets relative to full document.
+    조문이 limit을 넘는 드문 경우를 대비한 안전 분할(문단 경계 우선).
+    기본적으로 현 문서에서는 분할이 발생하지 않도록 limit을 크게 둠.
     """
-    # try to split by double newline boundaries
-    relative = text
-    if len(relative) <= limit:
-        return [(start, start + len(relative))]
+    if len(text) <= limit:
+        return [(start, start + len(text))]
+
     parts: List[Tuple[int, int]] = []
     s = 0
-    while s < len(relative):
-        e = min(s + limit, len(relative))
-        # move e to nearest paragraph boundary if possible
-        candidate = relative.rfind("\n\n", s, e)
-        if candidate != -1 and candidate > s + MIN_CHUNK_CHARS:
-            e = candidate + 2  # include the boundary
+    while s < len(text):
+        e = min(s + limit, len(text))
+        # 문단 경계(\n\n)로 당겨서 자르기
+        cut = text.rfind("\n\n", s, e)
+        if cut != -1 and cut > s + 200:  # 최소 200자 확보 후 자르기
+            e = cut + 2
         parts.append((start + s, start + e))
         s = e
     return parts
@@ -103,65 +102,43 @@ def make_chunks(
     law_name: Optional[str] = None,
 ) -> List[Chunk]:
     """
-    Article-only chunking with safety:
-      - leaves sorted by span_start
-      - overly long article split by paragraph boundaries (kept within the same article)
-      - very short fragments merged into neighbors when possible
+    단계 1: '조문 단위' 청크를 1:1로 생성 (필요 시 같은 조문 안에서만 part 분할)
+    - 절대 다른 조문끼리 병합하지 않음
+    - 커버리지 100%에 최대한 근접(≈99%)하도록 설계
     """
     leaves = _gather_leaves(result.root)
     chunks: List[Chunk] = []
 
-    # First pass: create article chunks (with split if needed)
-    tmp: List[Chunk] = []
     for leaf in leaves:
         section_label = f"{leaf.label} {leaf.num}".strip()
-        meta = {
+        meta_base = {
             "mode": "article_only",
             "doc_type": result.doc_type,
             "law_name": law_name or "",
             "section_label": section_label,
             "source_file": source_file or "",
         }
+
+        # 같은 조문 내에서만 필요시 part 분할
         spans = _split_long_article(
             text=result.full_text[leaf.span_start:leaf.span_end],
             start=leaf.span_start,
             limit=MAX_NODE_CHARS,
         )
-        # create chunks per span
+
         for k, (s, e) in enumerate(spans, 1):
-            part_suffix = f" (part {k})" if len(spans) > 1 else ""
-            tmp.append(
+            label = section_label + (f" (part {k})" if len(spans) > 1 else "")
+            chunks.append(
                 Chunk(
                     text=result.full_text[s:e],
                     span_start=s,
                     span_end=e,
                     node_ids=[leaf.node_id],
                     breadcrumbs=_breadcrumbs(leaf, result),
-                    meta={**meta, "section_label": section_label + part_suffix},
+                    meta={**meta_base, "section_label": label},
                 )
             )
 
-    # Second pass: merge too-short chunks to neighbors
-    i = 0
-    while i < len(tmp):
-        cur = tmp[i]
-        if len(cur.text) < MIN_CHUNK_CHARS and i + 1 < len(tmp):
-            nxt = tmp[i + 1]
-            # merge into next
-            merged = Chunk(
-                text=cur.text + nxt.text,
-                span_start=cur.span_start,
-                span_end=nxt.span_end,
-                node_ids=list({*cur.node_ids, *nxt.node_ids}),
-                breadcrumbs=cur.breadcrumbs,
-                meta=cur.meta,
-            )
-            tmp[i + 1] = merged
-            i += 2
-            continue
-        chunks.append(cur)
-        i += 1
-
-    # Ensure final order
+    # 문서 순서 보장
     chunks.sort(key=lambda c: c.span_start)
     return chunks
