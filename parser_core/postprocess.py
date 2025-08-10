@@ -5,14 +5,12 @@ from typing import List, Optional, Tuple, Dict, Any
 from .schema import ParseResult, Node, Chunk
 from .rules_th import normalize_text
 
-# 조문 분할 상한(사실상 비활성)
-MAX_NODE_CHARS = 10000
+MAX_NODE_CHARS = 10000  # 사실상 비활성
 
 # ───────────────────────────── 검증 ───────────────────────────── #
 
 def validate_tree(result: ParseResult) -> List[str]:
     issues: List[str] = []
-
     def _check(n: Node):
         for i, c in enumerate(n.children):
             if i + 1 < len(n.children):
@@ -21,7 +19,6 @@ def validate_tree(result: ParseResult) -> List[str]:
                     issues.append(f"Span overlap at {c.label} {c.num} -> {nxt.label} {nxt.num}")
             _check(c)
     _check(result.root)
-
     for n in result.all_nodes:
         if n is result.root or n.label == "front_matter":
             continue
@@ -106,7 +103,6 @@ def _article_series_index(leaves: List[Node]) -> Dict[str, int]:
             return int(str(num).split("/")[0])
         except Exception:
             return 10**9
-
     series = 1
     prev = -1
     mapping: Dict[str, int] = {}
@@ -158,10 +154,9 @@ def make_chunks(
     strict_lossless: bool = False,
 ) -> Tuple[List[Chunk], Dict[str, Any]]:
     """
-    조문 1:1 + front_matter/headnote/gap 보강(옵션)
     Strict 모드:
-      - headnote 길이 필터 비활성(=0 취급)
-      - 최종 정리 후 남은 간극을 post-fill로 모두 orphan_gap 생성(공백-only 포함)
+      - headnote/gap 길이 필터 비활성
+      - 모든 정리 후 post-fill로 남은 간극을 orphan_gap으로 보강(공백-only 포함)
     """
     text = result.full_text
     total_len = len(text)
@@ -177,14 +172,12 @@ def make_chunks(
     # 1) article leaves
     leaves = _collect_article_leaves(result.root)
     series_map = _article_series_index(leaves)
-
     article_index = 0
     for leaf in leaves:
         article_index += 1
         section_label = f"{leaf.label} {leaf.num}".strip()
         crumbs = _breadcrumbs(leaf, result)
         section_uid = "/".join(crumbs) if crumbs else section_label
-
         spans = [(leaf.span_start, leaf.span_end)]
         new_spans: List[Tuple[int, int]] = []
         for s, e in spans:
@@ -200,7 +193,6 @@ def make_chunks(
                         q = cut + 2
                     new_spans.append((p, q))
                     p = q
-
         for k, (s, e) in enumerate(new_spans, 1):
             label = section_label + (f" (part {k})" if len(new_spans) > 1 else "")
             meta = {
@@ -215,16 +207,8 @@ def make_chunks(
                 "series": str(series_map.get(leaf.node_id, 1)),
                 "retrieval_weight": str(_retrieval_weight_for("article")),
             }
-            chunks.append(
-                Chunk(
-                    text=text[s:e],
-                    span_start=s,
-                    span_end=e,
-                    node_ids=[leaf.node_id],
-                    breadcrumbs=crumbs,
-                    meta=meta,
-                )
-            )
+            chunks.append(Chunk(text=text[s:e], span_start=s, span_end=e,
+                                node_ids=[leaf.node_id], breadcrumbs=crumbs, meta=meta))
 
     # 2) front_matter
     if include_front_matter:
@@ -232,7 +216,6 @@ def make_chunks(
             if n.label == "front_matter" and (n.span_end - n.span_start) > 0:
                 frag = text[n.span_start:n.span_end]
                 if strict_lossless or frag.strip():
-                    crumbs = ["front_matter"]
                     meta = {
                         "type": "front_matter",
                         "mode": mode,
@@ -243,26 +226,15 @@ def make_chunks(
                         "source_file": source_file or "",
                         "retrieval_weight": str(_retrieval_weight_for("front_matter")),
                     }
-                    chunks.append(
-                        Chunk(
-                            text=frag,
-                            span_start=n.span_start,
-                            span_end=n.span_end,
-                            node_ids=[n.node_id],
-                            breadcrumbs=crumbs,
-                            meta=meta,
-                        )
-                    )
+                    chunks.append(Chunk(text=frag, span_start=n.span_start, span_end=n.span_end,
+                                        node_ids=[n.node_id], breadcrumbs=["front_matter"], meta=meta))
                 break
 
-    # 3) headnotes (레벨+이명 허용 / Strict면 길이 필터 해제)
+    # 3) headnotes (허용 레벨 + 'บท*' 이명, Strict면 길이 필터 해제)
     if include_headnotes:
         allowed = set(allowed_headnote_levels)
         def is_allowed_label(lbl: Optional[str]) -> bool:
-            if not lbl:
-                return False
-            return (lbl in allowed) or lbl.startswith("บท")  # 이명 허용
-
+            return bool(lbl) and (lbl in allowed or lbl.startswith("บท"))
         def walk(parent: Node):
             nonlocal diag
             if is_allowed_label(parent.label):
@@ -287,16 +259,8 @@ def make_chunks(
                             "source_file": source_file or "",
                             "retrieval_weight": str(_retrieval_weight_for("headnote")),
                         }
-                        chunks.append(
-                            Chunk(
-                                text=frag,
-                                span_start=s,
-                                span_end=e,
-                                node_ids=[parent.node_id],
-                                breadcrumbs=crumbs,
-                                meta=meta,
-                            )
-                        )
+                        chunks.append(Chunk(text=frag, span_start=s, span_end=e,
+                                            node_ids=[parent.node_id], breadcrumbs=crumbs, meta=meta))
                         diag["headnote_after_filter"] += 1
                     else:
                         diag["short_headnotes_removed"] += 1
@@ -310,19 +274,14 @@ def make_chunks(
         gaps: List[Tuple[int, int]] = []
         prev = 0
         for s, e in ivs:
-            if s > prev:
-                gaps.append((prev, s))
+            if s > prev: gaps.append((prev, s))
             prev = e
-        if prev < total_len:
-            gaps.append((prev, total_len))
-
+        if prev < total_len: gaps.append((prev, total_len))
         for idx, (s, e) in enumerate(gaps, 1):
-            if e <= s:
-                continue
+            if e <= s: continue
             frag = text[s:e]
             keep = (e - s) > 0 if strict_lossless else (len(frag.strip()) >= min_gap_len)
             if keep:
-                crumbs = _find_path_at_offset(result, s)
                 meta = {
                     "type": "orphan_gap",
                     "mode": mode,
@@ -333,16 +292,8 @@ def make_chunks(
                     "source_file": source_file or "",
                     "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
                 }
-                chunks.append(
-                    Chunk(
-                        text=frag,
-                        span_start=s,
-                        span_end=e,
-                        node_ids=[],
-                        breadcrumbs=crumbs,
-                        meta=meta,
-                    )
-                )
+                chunks.append(Chunk(text=frag, span_start=s, span_end=e,
+                                    node_ids=[], breadcrumbs=_find_path_at_offset(result, s), meta=meta))
 
     # ── 정리: 정렬 → 동기화 → 동일구간 dedupe → 연속 겹침 클립 ── #
     chunks.sort(key=lambda c: (c.span_start, c.span_end))
@@ -350,9 +301,8 @@ def make_chunks(
     cleaned: List[Chunk] = []
     for c in chunks:
         s, e = c.span_start, c.span_end
-        if s is None or e is None or e <= s:
-            continue
-        c.text = text[s:e]  # 원문으로 재동기화
+        if s is None or e is None or e <= s: continue
+        c.text = text[s:e]  # 원문 재동기화
         if not strict_lossless and c.text.strip() == "":
             continue
         cleaned.append(c)
@@ -362,8 +312,7 @@ def make_chunks(
     dedup1: List[Chunk] = []
     for c in chunks:
         key = (c.span_start, c.span_end)
-        if key in seen_span:
-            continue
+        if key in seen_span: continue
         seen_span.add(key)
         dedup1.append(c)
     chunks = dedup1
@@ -376,36 +325,34 @@ def make_chunks(
             s = last_end  # 전방 클립
         if e - s <= 0:
             continue
-        if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
-            if not strict_lossless or c.meta.get("type") != "orphan_gap":
-                thr = min_headnote_len if c.meta.get("type")=="headnote" else min_gap_len
+
+        # 🔧 핵심 수정: Strict일 때는 headnote/gap/front_matter 길이 필터 완전 비활성화
+        if not strict_lossless:
+            if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
+                thr = min_headnote_len if c.meta.get("type") == "headnote" else min_gap_len
                 if (e - s) < thr:
-                    # Strict OFF에서 짧은 머리말/갭 제거
                     if c.meta.get("type") == "headnote":
                         diag["short_headnotes_removed"] += 1
                     continue
+
         c.span_start, c.span_end = s, e
         c.text = text[s:e]
         final.append(c)
         last_end = e
 
-    # ── Strict 전용 post-fill: 마지막까지 남은 간극 모두 메움 ── #
+    # ── Strict 전용 post-fill ── #
     if strict_lossless:
         ivs2 = _compute_union([(c.span_start, c.span_end) for c in final])
         post_gaps: List[Tuple[int, int]] = []
         prev = 0
         for s, e in ivs2:
-            if s > prev:
-                post_gaps.append((prev, s))
+            if s > prev: post_gaps.append((prev, s))
             prev = e
-        if prev < total_len:
-            post_gaps.append((prev, total_len))
+        if prev < total_len: post_gaps.append((prev, total_len))
 
         for (s, e) in post_gaps:
-            if e <= s:
-                continue
+            if e <= s: continue
             frag = text[s:e]   # 공백-only라도 포함
-            crumbs = _find_path_at_offset(result, s)
             meta = {
                 "type": "orphan_gap",
                 "mode": mode,
@@ -417,16 +364,8 @@ def make_chunks(
                 "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
                 "strict_fill": "1",
             }
-            final.append(
-                Chunk(
-                    text=frag,
-                    span_start=s,
-                    span_end=e,
-                    node_ids=[],
-                    breadcrumbs=crumbs,
-                    meta=meta,
-                )
-            )
+            final.append(Chunk(text=frag, span_start=s, span_end=e,
+                               node_ids=[], breadcrumbs=_find_path_at_offset(result, s), meta=meta))
             diag["strict_post_fill"]["filled_gaps"] += 1
             diag["strict_post_fill"]["total_chars"] += (e - s)
             if len(diag["strict_post_fill"]["spans"]) < 5:

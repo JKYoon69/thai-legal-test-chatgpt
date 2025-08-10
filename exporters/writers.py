@@ -24,15 +24,9 @@ def to_jsonl(chunks: List[Chunk]) -> str:
         lines.append(json.dumps(obj, ensure_ascii=False))
     return "\n".join(lines)
 
-def make_zip_bundle(
-    source_text: str,
-    parse_result: ParseResult,
-    chunks: List[Chunk],
-    source_file: str,
-    law_name: str,
-    run_config: Dict[str, Any] | None = None,
-    debug: Dict[str, Any] | None = None,
-) -> io.BytesIO:
+def make_zip_bundle(source_text: str, parse_result: ParseResult, chunks: List[Chunk],
+                    source_file: str, law_name: str, run_config: Dict[str, Any] | None = None,
+                    debug: Dict[str, Any] | None = None) -> io.BytesIO:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("SOURCE.txt", source_text)
@@ -41,7 +35,7 @@ def make_zip_bundle(
     buf.seek(0)
     return buf
 
-# ───────────────────────────── helpers ───────────────────────────── #
+# ── helpers ── #
 
 def _span_union(chunks: List[Chunk]) -> Tuple[int, List[Tuple[int,int]]]:
     ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
@@ -66,19 +60,14 @@ def _overlap_diagnostics(chunks: List[Chunk]) -> Dict[str, Any]:
     chs = sorted(chunks, key=lambda c: (c.span_start, c.span_end))
     overlaps=0
     by_pair: Counter = Counter()
-    last_s=last_e=None
-    last_t="?"
+    last_s=last_e=None; last_t="?"
     for c in chs:
-        s,e = c.span_start, c.span_end
-        t = c.meta.get("type","article")
+        s,e = c.span_start, c.span_end; t = c.meta.get("type","article")
         if last_s is not None and s < last_e:
-            overlaps += 1
-            by_pair[(last_t, t)] += 1
+            overlaps += 1; by_pair[(last_t, t)] += 1
         last_s, last_e, last_t = s,e,t
-    return {
-        "overlaps": overlaps,
-        "overlap_pairs_by_type": {f"{a}->{b}": cnt for (a,b),cnt in by_pair.items()}
-    }
+    return {"overlaps": overlaps,
+            "overlap_pairs_by_type": {f"{a}->{b}": cnt for (a,b),cnt in by_pair.items()}}
 
 def _tree_stats(parse_result: ParseResult) -> Dict[str, Any]:
     by_label: Counter = Counter(n.label or "?" for n in parse_result.all_nodes)
@@ -89,13 +78,11 @@ def _tree_stats(parse_result: ParseResult) -> Dict[str, Any]:
         for ch in p.children:
             if ch.span_start < p.span_start or ch.span_end > p.span_end:
                 span_issues.append(f"child outside parent: {ch.label} {ch.num} in {p.label} {p.num}")
-    return {
-        "node_count": len(parse_result.all_nodes),
-        "by_label": dict(by_label),
-        "max_depth": depth_max,
-        "empty_nodes": empty_nodes[:20],
-        "span_issues": span_issues[:20],
-    }
+    return {"node_count": len(parse_result.all_nodes),
+            "by_label": dict(by_label),
+            "max_depth": depth_max,
+            "empty_nodes": empty_nodes[:20],
+            "span_issues": span_issues[:20]}
 
 def _duplicates(chunks: List[Chunk]) -> Dict[str, Any]:
     import hashlib
@@ -108,11 +95,9 @@ def _duplicates(chunks: List[Chunk]) -> Dict[str, Any]:
         region_key.setdefault(k, []).append(i)
     exact_groups = sorted([(h, idxs) for h,idxs in hash_to_idxs.items() if len(idxs)>1], key=lambda x: len(x[1]), reverse=True)
     region_dups = sorted([(k, idxs) for k,idxs in region_key.items() if len(idxs)>1], key=lambda x: len(x[1]), reverse=True)
-    return {
-        "exact_dup_groups": len(exact_groups),
-        "region_dup_groups": len(region_dups),
-        "exact_dup_top": [{"count": len(idxs)} for h,idxs in exact_groups[:5]],
-    }
+    return {"exact_dup_groups": len(exact_groups),
+            "region_dup_groups": len(region_dups),
+            "exact_dup_top": [{"count": len(idxs)} for h,idxs in exact_groups[:5]]}
 
 def _largest_gaps(full_text: str, chunks: List[Chunk], topn: int = 5) -> List[Dict[str, Any]]:
     total = len(full_text)
@@ -123,37 +108,26 @@ def _largest_gaps(full_text: str, chunks: List[Chunk], topn: int = 5) -> List[Di
             merged.append([s,e])
         else:
             merged[-1][1] = max(merged[-1][1], e)
-    gaps = []
-    prev = 0
+    gaps = []; prev = 0
     for s,e in merged:
         if s>prev: gaps.append((prev, s))
         prev=e
     if prev < total: gaps.append((prev, total))
-    def snip(s,e):
-        frag = full_text[s:min(s+200, len(full_text))]
-        return frag.replace("\n","⏎")
+    def snip(s,e): return full_text[s:min(s+200, len(full_text))].replace("\n","⏎")
     gaps_sorted = sorted(gaps, key=lambda g: (g[1]-g[0]), reverse=True)[:topn]
     return [{"span": [s,e], "len": e-s, "preview": snip(s,e)} for s,e in gaps_sorted]
 
-# ───────────────────────────── 조문 크기 통계 ───────────────────────────── #
+# ── 조문 크기 통계 ── #
 
 def _percentiles(vals: List[int]) -> Dict[str, float]:
-    if not vals:
-        return {"p25":0,"p50":0,"p75":0,"min":0,"max":0,"mean":0.0}
+    if not vals: return {"p25":0,"p50":0,"p75":0,"min":0,"max":0,"mean":0.0}
     s = sorted(vals)
     def q(p: float) -> float:
-        k = (len(s)-1)*p
-        a = int(k); b = a+1
+        k = (len(s)-1)*p; a = int(k); b = a+1
         if b >= len(s): return float(s[a])
         return float(s[a] + (s[b]-s[a])*(k-a))
-    return {
-        "min": float(s[0]),
-        "p25": q(0.25),
-        "p50": q(0.50),
-        "p75": q(0.75),
-        "max": float(s[-1]),
-        "mean": float(sum(s)/len(s)),
-    }
+    return {"min": float(s[0]), "p25": q(0.25), "p50": q(0.50),
+            "p75": q(0.75), "max": float(s[-1]), "mean": float(sum(s)/len(s))}
 
 def _histogram(vals: List[int]) -> Dict[str, int]:
     buckets = [(0,200),(200,500),(500,1000),(1000,2000),(2000,5000),(5000,10**9)]
@@ -161,9 +135,7 @@ def _histogram(vals: List[int]) -> Dict[str, int]:
     counts = {n:0 for n in names}
     for v in vals:
         for (lo,hi),name in zip(buckets,names):
-            if lo <= v < hi:
-                counts[name] += 1
-                break
+            if lo <= v < hi: counts[name] += 1; break
     return counts
 
 def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
@@ -175,45 +147,30 @@ def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
     arts_sorted = sorted(arts, key=lambda c: len(c.text))
     shortest = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[:5]]
     longest  = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
-    return {
-        "count": len(arts),
-        "length_stats_chars": sizes,
-        "length_histogram": hist,
-        "series_counts": dict(by_series),
-        "top_shortest": shortest,
-        "top_longest": longest,
-    }
+    return {"count": len(arts), "length_stats_chars": sizes, "length_histogram": hist,
+            "series_counts": dict(by_series), "top_shortest": shortest, "top_longest": longest}
 
-# ───────────────────────────── REPORT ───────────────────────────── #
+# ── REPORT ── #
 
-def make_debug_report(
-    parse_result: ParseResult,
-    chunks: List[Chunk],
-    source_file: str,
-    law_name: str,
-    run_config: Dict[str, Any] | None = None,
-    debug: Dict[str, Any] | None = None,
-) -> str:
+def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_file: str,
+                      law_name: str, run_config: Dict[str, Any] | None = None,
+                      debug: Dict[str, Any] | None = None) -> str:
     full = parse_result.full_text
     union_len, merged = _span_union(chunks)
     src_len = len(full)
     coverage = (union_len / src_len) if src_len else 0.0
 
-    # integrity
     integ = _overlap_diagnostics(chunks)
     mismatches = 0
     for c in chunks:
-        if full[c.span_start:c.span_end] != c.text:
-            mismatches += 1
+        if full[c.span_start:c.span_end] != c.text: mismatches += 1
     integ["text_mismatches"] = mismatches
 
-    # types
     type_counts = Counter(c.meta.get("type","article") for c in chunks)
     type_sizes = Counter()
     for c in chunks:
         type_sizes[c.meta.get("type","article")] += len(c.text)
 
-    # make_chunks 진단(있으면)
     mk_diag = (debug or {}).get("make_chunks_diag", {}) if debug else {}
     strict_post_fill = mk_diag.get("strict_post_fill", {"enabled": False, "filled_gaps": 0, "total_chars": 0, "spans": []})
     short_headnotes_removed = mk_diag.get("short_headnotes_removed", 0)
@@ -242,7 +199,6 @@ def make_debug_report(
             "chunk_article_count": sum(1 for c in chunks if c.meta.get("type","article")=="article")
         },
         "article_size_stats": _article_size_stats(chunks),
-        # ⬇️ 새 디버그 항목
         "strict_post_fill": strict_post_fill,
         "short_headnotes_removed": short_headnotes_removed,
         "sample_chunk_head": (chunks[0].text[:400] if chunks else ""),
