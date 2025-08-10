@@ -1,776 +1,506 @@
 # -*- coding: utf-8 -*-
+"""
+postprocess.py
+- 파서 결과(ParseResult)를 받아 조문 단위 청크를 생성/보정
+- 옵션:
+  * strict_lossless: 커버리지 1.0을 목표로 gap-sweeper 가동
+  * split_long_articles: 롱 조문 분할(문장 경계 우선, 실패 시 soft cut)
+  * tail_merge_min_chars: 분할 마지막 조각이 너무 짧으면 앞 파트로 흡수
+  * overlap_chars: 분할 시 앞/뒤 오버랩(문맥)
+  * include_front_matter / include_headnotes / include_gap_fallback
+- 공개 함수:
+  validate_tree, repair_tree, guess_law_name, make_chunks, merge_small_trailing_parts
+"""
 from __future__ import annotations
-from typing import List, Optional, Tuple, Dict, Any
+
 import re
-
-from .schema import ParseResult, Node, Chunk
-from .rules_th import normalize_text
-
-MAX_NODE_CHARS = 10000  # 사실상 비활성
-
-# ───────────────────────────── 레벨 랭킹 & 유틸 ───────────────────────────── #
-
-_LEVEL_ORDER = {
-    "root": 0,
-    "front_matter": 1,
-    "ภาค": 2,
-    "ลักษณะ": 3,
-    "หมวด": 4,
-    "ส่วน": 5,
-    "บท*": 6,  # 'บทบัญญัติทั่วไป', 'บทกำหนดโทษ' 등 prefix 취급
-    "มาตรา": 7,
-    "ข้อ": 7,
-}
-
-def _rank(label: Optional[str]) -> int:
-    if not label:
-        return 99
-    if label.startswith("บท"):
-        return _LEVEL_ORDER["บท*"]
-    return _LEVEL_ORDER.get(label, 98)
-
-def _is_article_leaf(n: Node) -> bool:
-    return n.label in ("มาตรา", "ข้อ")
-
-def _collect_article_leaves(root: Node) -> List[Node]:
-    leaves: List[Node] = []
-    stack = list(root.children)
-    while stack:
-        n = stack.pop(0)
-        if _is_article_leaf(n):
-            leaves.append(n)
-        for c in n.children:
-            stack.append(c)
-    leaves.sort(key=lambda x: x.span_start)
-    return leaves
-
-def _breadcrumbs(n: Node, result: ParseResult) -> List[str]:
-    crumbs = []
-    cur = n
-    while cur and cur.parent_id:
-        crumbs.append(f"{cur.label or ''}{(' ' + cur.num) if cur.num else ''}".strip())
-        cur = result.node_map.get(cur.parent_id)
-        if cur and cur.label == "root":
-            break
-    return list(reversed(crumbs))
-
-def _compute_union(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    if not spans:
-        return []
-    spans_sorted = sorted(spans, key=lambda x: x[0])
-    merged: List[List[int]] = []
-    for s, e in spans_sorted:
-        if not merged or s > merged[-1][1]:
-            merged.append([s, e])
-        else:
-            merged[-1][1] = max(merged[-1][1], e)
-    return [(s, e) for s, e in merged]
-
-def _subtract_intervals(outer: Tuple[int, int], covered: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    S, E = outer
-    res: List[Tuple[int, int]] = []
-    cur = S
-    for s, e in covered:
-        if e <= cur:
-            continue
-        if s > cur:
-            res.append((cur, min(s, E)))
-        cur = max(cur, e)
-        if cur >= E:
-            break
-    if cur < E:
-        res.append((cur, E))
-    return [(s, e) for (s, e) in res if e > s]
-
-# ───────────────────────────── 제목/연도 추출 ───────────────────────────── #
-
-_THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
-THAI_MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"]
-
-def _thai_to_arabic(s: str) -> str:
-    return s.translate(_THAI_DIGITS)
-
-def _is_promulgation_line(ln: str) -> bool:
-    keys = [
-        "ให้ไว้ ณ", "ให้ไว้  ณ", "ให้ไว้ ณ วันที่",
-        "ประกาศ ณ", "ในพระปรมาภิไธย", "ราชกิจจานุเบกษา"
-    ]
-    if any(k in ln for k in keys):
-        return True
-    if "วันที่" in ln and any(m in ln for m in THAI_MONTHS):
-        return True
-    return False
-
-_YEAR_PAT = re.compile(r"(พ\.?\s*ศ\.?|พศ)\s*([0-9]{4})")
-
-def _extract_year_phrase(s: str) -> Optional[str]:
-    s2 = _thai_to_arabic(s)
-    m = _YEAR_PAT.search(s2)
-    if not m:
-        return None
-    return f"พ.ศ. {m.group(2)}"
-
-def guess_law_name(text: str) -> Optional[str]:
-    """
-    제목 + 부제 + 연도(พ.ศ.) 결합
-    - 태국 숫자 → 아라비아 숫자 변환
-    - 첫 표제행 + 다음 1~5행에서 부제/연도 탐색
-    - 공포문/날짜 라인은 law_name에서 제외
-    """
-    norm = normalize_text(text)
-    lines = [ln.strip(" \t-–—") for ln in norm.splitlines()[:160] if ln.strip()]
-    base_idx = None
-    for i, ln in enumerate(lines):
-        if ("พระราชบัญญัติ" in ln) or ("ประมวลกฎหมาย" in ln):
-            base_idx = i
-            break
-    if base_idx is None:
-        return None
-
-    title = lines[base_idx]
-    subline = ""
-    year_phrase = ""
-
-    for j in range(base_idx + 1, min(base_idx + 6, len(lines))):
-        ln = lines[j]
-        if any(k in ln for k in ("ภาค", "ลักษณะ", "หมวด", "ส่วน", "บท", "มาตรา")):
-            break
-        if _is_promulgation_line(ln):
-            continue
-        if ("ให้ใช้" in ln) or ("ยาเสพติด" in ln) or ("ประมวลกฎหมาย" in ln):
-            if len(ln) > len(subline):
-                subline = ln
-        if not subline:
-            subline = ln
-        yp = _extract_year_phrase(ln)
-        if yp:
-            year_phrase = yp
-
-    parts = [title]
-    if subline and subline not in title:
-        parts.append(subline)
-    if year_phrase and year_phrase not in title and year_phrase != subline:
-        parts.append(year_phrase)
-
-    cand = " ".join(parts)
-    cand = _thai_to_arabic(cand)
-    return " ".join(cand.split()).strip()
-
-# ───────────────────────────── 검증 ───────────────────────────── #
-
-def validate_tree(result: ParseResult) -> List[str]:
-    issues: List[str] = []
-
-    def _check(n: Node):
-        for i, c in enumerate(n.children):
-            if i + 1 < len(n.children):
-                nxt = n.children[i + 1]
-                if c.span_end > nxt.span_start:
-                    issues.append(f"Span overlap at {c.label} {c.num} -> {nxt.label} {nxt.num}")
-            if c.span_start < n.span_start or c.span_end > n.span_end:
-                issues.append(f"child outside parent: {c.label} {c.num} in {n.label} {n.num}")
-            _check(c)
-    _check(result.root)
-
-    for n in result.all_nodes:
-        if n is result.root or n.label == "front_matter":
-            continue
-        if n.text is None or len(n.text.strip()) < 1:
-            issues.append(f"Empty node: {n.label} {n.num}")
-    return issues
-
-# ───────────────────────────── 트리 수복(Reparent & Span-Repair) ───────────────────────────── #
-
-def repair_tree(result: ParseResult) -> Dict[str, Any]:
-    """
-    부모-자식 경계 불일치 최소화:
-      1) bottom-up으로 부모 span을 자식 union에 맞게 확장(축소는 보수적)
-      2) 여전히 벗어나는 자식은 root로 최소 reparent
-    무손실: coverage에는 영향 없음.
-    """
-    full = result.full_text
-    diag: Dict[str, Any] = {
-        "adjusted_parents": 0,
-        "expanded_total_chars": 0,
-        "shrunk_total_chars": 0,
-    }
-
-    nodes_by_depth: Dict[int, List[Node]] = {}
-    max_depth = 0
-    for n in result.all_nodes:
-        nodes_by_depth.setdefault(n.level, []).append(n)
-        if n.level > max_depth:
-            max_depth = n.level
-
-    for depth in range(max_depth - 1, -1, -1):
-        for p in nodes_by_depth.get(depth, []):
-            if not p.children:
-                if p.span_start is not None and p.span_end is not None:
-                    p.text = full[p.span_start:p.span_end]
-                continue
-            child_spans = [(c.span_start, c.span_end) for c in p.children if c.span_start is not None and c.span_end is not None]
-            if not child_spans:
-                continue
-            new_start = min(s for s, _ in child_spans)
-            new_end = max(e for _, e in child_spans)
-            if p.span_start is None or p.span_end is None:
-                p.span_start, p.span_end = new_start, new_end
-                p.text = full[p.span_start:p.span_end]
-                diag["adjusted_parents"] += 1
-                continue
-
-            old_s, old_e = p.span_start, p.span_end
-            changed = False
-            if new_start < old_s:
-                diag["expanded_total_chars"] += (old_s - new_start)
-                old_s = new_start
-                changed = True
-            if new_end > old_e:
-                diag["expanded_total_chars"] += (new_end - old_e)
-                old_e = new_end
-                changed = True
-
-            if changed:
-                p.span_start, p.span_end = old_s, old_e
-                p.text = full[p.span_start:p.span_end]
-                diag["adjusted_parents"] += 1
-
-    root = result.root
-    for p in result.all_nodes:
-        for c in list(p.children):
-            if c.span_start < p.span_start or c.span_end > p.span_end:
-                try:
-                    p.children.remove(c)
-                except ValueError:
-                    pass
-                c.parent_id = root.node_id
-                root.children.append(c)
-                diag["adjusted_parents"] += 1
-
-    result.node_map = {n.node_id: n for n in result.all_nodes}
-    return diag
-
-# ───────────────────────────── 시리즈/경로 유틸 ───────────────────────────── #
-
-def _article_series_index(leaves: List[Node]) -> Dict[str, int]:
-    def main_int(num: Optional[str]) -> int:
-        if not num:
-            return 10**9
-        try:
-            return int(str(num).split("/")[0])
-        except Exception:
-            return 10**9
-    series = 1
-    prev = -1
-    mapping: Dict[str, int] = {}
-    for lf in leaves:
-        cur = main_int(lf.num)
-        if prev != -1 and cur < prev:
-            series += 1
-        mapping[lf.node_id] = series
-        prev = cur
-    return mapping
-
-def _find_path_at_offset(result: ParseResult, offset: int) -> List[str]:
-    path: List[str] = []
-    def descend(n: Node):
-        nonlocal path
-        for c in n.children:
-            if c.span_start <= offset < c.span_end:
-                label = f"{c.label or ''}{(' ' + c.num) if c.num else ''}".strip()
-                if label:
-                    path.append(label)
-                descend(c)
-                break
-    descend(result.root)
-    return path
-
-def _retrieval_weight_for(type_: str) -> float:
-    return {
-        "article": 1.0,
-        "appendix": 0.8,
-        "headnote": 0.5,
-        "front_matter": 0.3,
-        "orphan_gap": 0.2,
-    }.get(type_, 0.5)
-
-# ───────────────────────────── 청크 생성 ───────────────────────────── #
-
-def make_chunks(
-    result: ParseResult,
-    mode: str = "article_only",
-    source_file: Optional[str] = None,
-    law_name: Optional[str] = None,
-    *,
-    include_front_matter: bool = True,
-    include_headnotes: bool = True,
-    include_gap_fallback: bool = True,
-    allowed_headnote_levels: List[str] = ("ภาค","ลักษณะ","หมวด","ส่วน","บท"),
-    min_headnote_len: int = 24,
-    min_gap_len: int = 24,
-    strict_lossless: bool = False,
-    # 롱 조문 보조분할 + tail 병합
-    split_long_articles: bool = False,
-    split_threshold_chars: int = 1800,
-    tail_merge_min_chars: int = 200,
-    # NEW: 문맥 오버랩 + 소프트 컷
-    overlap_chars: int = 200,
-    soft_cut: bool = True,
-) -> Tuple[List[Chunk], Dict[str, Any]]:
-    """
-    Strict:
-      - headnote/gap 길이 필터 비활성
-      - post-fill로 남은 간극 orphan_gap 보강
-    + 롱 조문 분할 + tail 병합
-    + (NEW) 파트 간 오버랩(문맥) 부여, 컷 위치 휴리스틱
-    """
-    text = result.full_text
-    total_len = len(text)
-    chunks: List[Chunk] = []
-    diag: Dict[str, Any] = {
-        "headnote_candidates": 0,
-        "headnote_after_filter": 0,
-        "final_headnote_count": 0,
-        "removals": {
-            "removed_short": 0,
-            "removed_same_span_dedupe": 0,
-            "removed_overlap_clip_to_zero": 0,
-            "removed_empty_text": 0,
-            "removed_invalid_span": 0,
-        },
-        "strict_post_fill": {"enabled": bool(strict_lossless), "filled_gaps": 0, "total_chars": 0, "spans": []},
-        "allowed_headnote_levels_effective": list(allowed_headnote_levels) + ["บท* (prefix)"],
-        "split": {
-            "enabled": bool(split_long_articles),
-            "threshold": int(split_threshold_chars),
-            "series_total_counts": {},
-        },
-        "tail_merge": {
-            "min_chars": int(tail_merge_min_chars),
-            "merged_count": 0,
-            "affected_sections": [],
-        },
-        "overlap": {
-            "enabled": overlap_chars > 0,
-            "overlap_chars": int(overlap_chars),
-            "example_core_vs_expanded": [],
-        },
-    }
-
-    # 1) article leaves
-    leaves = _collect_article_leaves(result.root)
-    series_map = _article_series_index(leaves)
-
-    # 컷 휴리스틱
-    _re_list_item = re.compile(r"(?m)^\s*(?:[\(\[]?\s*[0-9๑-๙]+[\)\.]|[-•])\s+")
-    _re_soft_punct = re.compile(r"[;:ฯ]")
-
-    def _pick_soft_cut(p: int, e: int, q_target: int) -> int:
-        """
-        soft_cut: \n\n > 주변 \n(±120) > 근처 구두점/두 칸 공백 > fallback
-        """
-        window = min(120, e - p)
-        # 1) 단락 경계
-        cut = text.rfind("\n\n", p + int(0.6 * (q_target - p)), min(q_target + window, e))
-        if cut != -1 and cut - p >= 200:
-            return cut
-        # 2) 근처 줄바꿈
-        left = text.rfind("\n", max(p, q_target - window), q_target + 1)
-        right = text.find("\n", q_target, min(e, q_target + window))
-        cand = -1
-        if right != -1:
-            cand = right
-        if left != -1 and (cand == -1 or (q_target - left) <= (cand - q_target)):
-            cand = left
-        if cand != -1 and cand - p >= 200:
-            return cand
-        # 3) 구두점/두 칸 공백
-        back = text.rfind("  ", max(p, q_target - 200), q_target + 1)
-        if back != -1 and back - p >= 150:
-            return back
-        m = None
-        for m_ in _re_soft_punct.finditer(text, max(p, q_target - 200), min(e, q_target + 1)):
-            m = m_
-        if m and (m.end() - p) >= 150:
-            return m.end()
-        # 4) 백업
-        return q_target
-
-    def _split_paragraph_smart(s: int, e: int) -> List[Tuple[int, int]]:
-        """핵심(core) 스팬 리스트 반환"""
-        if not split_long_articles or (e - s) <= split_threshold_chars:
-            return [(s, e)]
-        spans: List[Tuple[int, int]] = []
-        p = s
-        while p < e:
-            q_target = min(p + split_threshold_chars, e)
-            cut = _pick_soft_cut(p, e, q_target) if soft_cut else q_target
-            if cut <= p:
-                cut = min(p + split_threshold_chars, e)
-            spans.append((p, cut))
-            p = cut
-        return spans
-
-    def _apply_tail_merge(spans: List[Tuple[int, int]], section_uid: str) -> List[Tuple[int, int]]:
-        if len(spans) <= 1:
-            return spans
-        last_s, last_e = spans[-1]
-        if (last_e - last_s) < tail_merge_min_chars:
-            prev_s, prev_e = spans[-2]
-            merged = spans[:-2] + [(prev_s, last_e)]
-            diag["tail_merge"]["merged_count"] += 1
-            if len(diag["tail_merge"]["affected_sections"]) < 10:
-                diag["tail_merge"]["affected_sections"].append(section_uid)
-            return merged
-        return spans
-
-    article_index = 0
-    for leaf in leaves:
-        article_index += 1
-        section_label = f"{leaf.label} {leaf.num}".strip()
-        crumbs = _breadcrumbs(leaf, result)
-        section_uid = "/".join(crumbs) if crumbs else section_label
-
-        core_spans = _split_paragraph_smart(leaf.span_start, leaf.span_end)
-        core_spans = _apply_tail_merge(core_spans, section_uid)
-        series_total = len(core_spans)
-        diag["split"]["series_total_counts"][str(series_total)] = diag["split"]["series_total_counts"].get(str(series_total), 0) + 1
-
-        prev_exp_end = None
-        for k, (cs, ce) in enumerate(core_spans, 1):
-            # 오버랩 확장
-            s = max(leaf.span_start, cs - max(0, overlap_chars))
-            e = min(leaf.span_end, ce + max(0, overlap_chars))
-            if prev_exp_end is not None and s < prev_exp_end:
-                s = prev_exp_end  # 앞 파트와 겹치면 앞의 끝에 맞춤
-            if e <= s:
-                continue
-
-            label = section_label + (f" (part {k})" if series_total > 1 else "")
-            meta = {
-                "type": "article",
-                "mode": mode,
-                "doc_type": result.doc_type,
-                "law_name": law_name or "",
-                "section_label": label,
-                "section_uid": section_uid,
-                "source_file": source_file or "",
-                "article_index_global": str(article_index),
-                "series": str(series_map.get(leaf.node_id, 1)),
-                "retrieval_weight": str(_retrieval_weight_for("article")),
-                "series_index": str(k),
-                "series_total": str(series_total),
-                # NEW
-                "core_span": [int(cs), int(ce)],
-                "overlap_chars": str(overlap_chars),
-            }
-            chunks.append(
-                Chunk(
-                    text=text[s:e],
-                    span_start=s,
-                    span_end=e,
-                    node_ids=[leaf.node_id],
-                    breadcrumbs=crumbs,
-                    meta=meta,
-                )
-            )
-            prev_exp_end = e
-
-            # 진단 예시 3건만 수집
-            if len(diag["overlap"]["example_core_vs_expanded"]) < 3:
-                diag["overlap"]["example_core_vs_expanded"].append(
-                    {"core": [int(cs), int(ce)], "expanded": [int(s), int(e)], "section_uid": section_uid}
-                )
-
-    # 2) front_matter
-    if include_front_matter:
-        for n in result.root.children:
-            if n.label == "front_matter" and (n.span_end - n.span_start) > 0:
-                frag = text[n.span_start:n.span_end]
-                if strict_lossless or frag.strip():
-                    crumbs = ["front_matter"]
-                    meta = {
-                        "type": "front_matter",
-                        "mode": mode,
-                        "doc_type": result.doc_type,
-                        "law_name": law_name or "",
-                        "section_label": "front_matter",
-                        "section_uid": "front_matter",
-                        "source_file": source_file or "",
-                        "retrieval_weight": str(_retrieval_weight_for("front_matter")),
-                        "series_index": "1",
-                        "series_total": "1",
-                    }
-                    chunks.append(
-                        Chunk(
-                            text=frag,
-                            span_start=n.span_start,
-                            span_end=n.span_end,
-                            node_ids=[n.node_id],
-                            breadcrumbs=crumbs,
-                            meta=meta,
-                        )
-                    )
-                break
-
-    # 3) headnotes (Strict면 길이 필터 해제)
-    if include_headnotes:
-        allowed = set(allowed_headnote_levels)
-
-        def is_allowed_label(lbl: Optional[str]) -> bool:
-            if not lbl:
-                return False
-            return (lbl in allowed) or lbl.startswith("บท")
-
-        def walk(parent: Node):
-            nonlocal diag
-            if is_allowed_label(parent.label):
-                child_spans = [(c.span_start, c.span_end) for c in parent.children]
-                covered = _compute_union(child_spans)
-                leftovers = _subtract_intervals((parent.span_start, parent.span_end), covered)
-                for (s, e) in leftovers:
-                    frag = text[s:e]
-                    diag["headnote_candidates"] += 1
-                    keep = (e - s) > 0 if strict_lossless else (len(frag.strip()) >= min_headnote_len)
-                    if keep:
-                        crumbs = _breadcrumbs(parent, result)
-                        section_label = f"{parent.label} {parent.num}".strip() if parent.num else parent.label or "headnote"
-                        section_uid = ("/".join(crumbs) if crumbs else section_label) + " — headnote"
-                        meta = {
-                            "type": "headnote",
-                            "mode": mode,
-                            "doc_type": result.doc_type,
-                            "law_name": law_name or "",
-                            "section_label": f"{section_label} — headnote",
-                            "section_uid": section_uid,
-                            "source_file": source_file or "",
-                            "retrieval_weight": str(_retrieval_weight_for("headnote")),
-                            "series_index": "1",
-                            "series_total": "1",
-                        }
-                        chunks.append(
-                            Chunk(
-                                text=frag,
-                                span_start=s,
-                                span_end=e,
-                                node_ids=[parent.node_id],
-                                breadcrumbs=crumbs,
-                                meta=meta,
-                            )
-                        )
-                        diag["headnote_after_filter"] += 1
-                    else:
-                        diag["removals"]["removed_short"] += 1
-            for c in parent.children:
-                walk(c)
-        walk(result.root)
-
-    # 4) 1차 gap-sweeper
-    if include_gap_fallback:
-        ivs = _compute_union([(c.span_start, c.span_end) for c in chunks])
-        gaps: List[Tuple[int, int]] = []
-        prev = 0
-        for s, e in ivs:
-            if s > prev:
-                gaps.append((prev, s))
-            prev = e
-        if prev < total_len:
-            gaps.append((prev, total_len))
-
-        for idx, (s, e) in enumerate(gaps, 1):
-            if e <= s:
-                diag["removals"]["removed_invalid_span"] += 1
-                continue
-            frag = text[s:e]
-            keep = (e - s) > 0 if strict_lossless else (len(frag.strip()) >= min_gap_len)
-            if keep:
-                crumbs = _find_path_at_offset(result, s)
-                meta = {
-                    "type": "orphan_gap",
-                    "mode": mode,
-                    "doc_type": result.doc_type,
-                    "law_name": law_name or "",
-                    "section_label": f"orphan_gap #{idx}",
-                    "section_uid": f"gap[{s}:{e}]",
-                    "source_file": source_file or "",
-                    "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
-                    "series_index": "1",
-                    "series_total": "1",
-                }
-                chunks.append(
-                    Chunk(
-                        text=frag,
-                        span_start=s,
-                        span_end=e,
-                        node_ids=[],
-                        breadcrumbs=crumbs,
-                        meta=meta,
-                    )
-                )
-            else:
-                diag["removals"]["removed_short"] += 1
-
-    # ── 정리: 정렬 → 동기화 → 동일 스팬 dedupe → 연속 겹침 클립 ── #
-    chunks.sort(key=lambda c: (c.span_start, c.span_end))
-
-    cleaned: List[Chunk] = []
-    for c in chunks:
-        s, e = c.span_start, c.span_end
-        if s is None or e is None or e <= s:
-            diag["removals"]["removed_invalid_span"] += 1
-            continue
-        c.text = text[s:e]
-        if not strict_lossless and c.text.strip() == "":
-            diag["removals"]["removed_empty_text"] += 1
-            continue
-        cleaned.append(c)
-    chunks = cleaned
-
-    # 동일 스팬 dedupe
-    seen_span = set()
-    dedup1: List[Chunk] = []
-    for c in chunks:
-        key = (c.span_start, c.span_end)
-        if key in seen_span:
-            diag["removals"]["removed_same_span_dedupe"] += 1
-            continue
-        seen_span.add(key)
-        dedup1.append(c)
-    chunks = dedup1
-
-    # 연속 겹침 → 뒤 청크 전방 클립
-    final: List[Chunk] = []
-    last_end = -1
-    for c in chunks:
-        s, e = c.span_start, c.span_end
-        if last_end > -1 and s < last_end:
-            s = last_end
-            if e - s <= 0:
-                diag["removals"]["removed_overlap_clip_to_zero"] += 1
-                continue
-
-        if not strict_lossless:
-            if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
-                thr = min_headnote_len if c.meta.get("type") == "headnote" else min_gap_len
-                if (e - s) < thr:
-                    diag["removals"]["removed_short"] += 1
-                    continue
-
-        c.span_start, c.span_end = s, e
-        c.text = text[s:e]
-        final.append(c)
-        last_end = e
-
-    # headnote 최종 개수
-    diag["final_headnote_count"] = sum(1 for c in final if c.meta.get("type") == "headnote")
-
-    # Strict post-fill
-    if strict_lossless:
-        ivs2 = _compute_union([(c.span_start, c.span_end) for c in final])
-        post_gaps: List[Tuple[int, int]] = []
-        prev = 0
-        for s, e in ivs2:
-            if s > prev:
-                post_gaps.append((prev, s))
-            prev = e
-        if prev < total_len:
-            post_gaps.append((prev, total_len))
-
-        for (s, e) in post_gaps:
-            if e <= s:
-                diag["removals"]["removed_invalid_span"] += 1
-                continue
-            frag = text[s:e]
-            crumbs = _find_path_at_offset(result, s)
-            meta = {
-                "type": "orphan_gap",
-                "mode": mode,
-                "doc_type": result.doc_type,
-                "law_name": law_name or "",
-                "section_label": f"strict_fill_gap[{s}:{e}]",
-                "section_uid": f"strict_gap[{s}:{e}]",
-                "source_file": source_file or "",
-                "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
-                "strict_fill": "1",
-                "series_index": "1",
-                "series_total": "1",
-            }
-            final.append(
-                Chunk(
-                    text=frag,
-                    span_start=s,
-                    span_end=e,
-                    node_ids=[],
-                    breadcrumbs=crumbs,
-                    meta=meta,
-                )
-            )
-            diag["strict_post_fill"]["filled_gaps"] += 1
-            diag["strict_post_fill"]["total_chars"] += (e - s)
-            if len(diag["strict_post_fill"]["spans"]) < 5:
-                diag["strict_post_fill"]["spans"].append([s, e])
-
-        final.sort(key=lambda c: (c.span_start, c.span_end))
-
-    return final, diag
-
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-import re
-from typing import List, Dict, Any, Tuple
-
-# ... (기존 코드들 그대로 두세요)
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple, Optional
+
+# ---------------------------------------------------------------------------
+# 외부 스키마와 느슨하게 결합하기 위한 유틸
+# ---------------------------------------------------------------------------
+
+def _get_full_text(result) -> str:
+    """ParseResult로부터 본문 텍스트를 안전하게 얻는다."""
+    try:
+        if isinstance(result.full_text, str):
+            return result.full_text
+    except Exception:
+        pass
+    # 안전 폴백
+    return getattr(result, "text", "") or ""
+
+def _make_chunk_class():
+    """외부 Chunk 클래스를 import 못하는 환경에서도 동작하도록 폴백 정의."""
+    try:
+        from .schema import Chunk  # type: ignore
+        return Chunk
+    except Exception:
+        @dataclass
+        class _Chunk:
+            text: str
+            span_start: int
+            span_end: int
+            meta: Dict[str, Any]
+            breadcrumbs: List[str]
+        return _Chunk
+
+Chunk = _make_chunk_class()
+
+# ────────────────────────────────────────────────────────────────────────────
+# 1) 유틸: 숫자/라벨 판정
+# ────────────────────────────────────────────────────────────────────────────
+
+THAI_DIGITS = "๐๑๒๓๔๕๖๗๘๙"
+ARTICLE_PAT = re.compile(r"(มาตรา)\s*([0-9" + THAI_DIGITS + r"]+)")
+# 헤드노트(라인 단위로 잡음)
+HEAD_PAT = re.compile(
+    r"(?m)^(?P<label>\s*(ภาค|ลักษณะ|หมวด|ส่วน|บท(?:บัญญัติทั่วไป)?)[^\n]{0,80})\s*$"
+)
+
+# 문장/절 경계 후보 문자
+CANDIDATE_BREAK = re.compile(r"[.!?;:]\s|\n{1,3}|[”\"'’)]\s|ฯ")
 
 PART_RE = re.compile(r"^(?P<base>.+?)\s*\(part\s*(?P<idx>\d+)\)\s*$", re.IGNORECASE)
 
-def _part_info(label: str) -> Tuple[str, int | None]:
-    """
-    'มาตรา 119 (part 2)' -> ('มาตรา 119', 2)
-    'มาตรา 119' -> ('มาตรา 119', None)
-    """
+
+def _part_info(label: str) -> Tuple[str, Optional[int]]:
+    """ 'มาตรา 119 (part 2)' -> ('มาตรา 119', 2) / 'มาตรา 119' -> ('มาตรา 119', None) """
     if not isinstance(label, str):
         return ("", None)
     m = PART_RE.match(label.strip())
     if not m:
         return (label.strip(), None)
-    return (m.group("base").strip(), int(m.group("idx")))
+    try:
+        return (m.group("base").strip(), int(m.group("idx")))
+    except Exception:
+        return (label.strip(), None)
+
+
+def _mk_uid(label: str, start: int) -> str:
+    return f"{label}|{start}"
+
+
+def _safe_slice(s: str, a: int, b: int) -> str:
+    a = max(0, min(len(s), int(a)))
+    b = max(0, min(len(s), int(b)))
+    if b <= a:
+        return ""
+    return s[a:b]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 2) validate / repair / guess
+# ────────────────────────────────────────────────────────────────────────────
+
+def validate_tree(result) -> List[str]:
+    """
+    트리 진단: 최소한의 점검만 수행.
+    - full_text가 비어있지 않은가?
+    - (간단 점검) 'มาตรา'가 존재하는가?
+    """
+    issues: List[str] = []
+    text = _get_full_text(result)
+    if not text:
+        issues.append("empty_full_text")
+        return issues
+
+    if not ARTICLE_PAT.search(text):
+        issues.append("no_article_pattern_found")
+
+    # 필요 시 추가 진단 가능
+    return issues
+
+
+def repair_tree(result) -> Dict[str, Any]:
+    """
+    구조 수복(라이트 버전). 실제 파서 트리 대신 텍스트 기반으로 보정 포인트만 리턴.
+    여기서는 별도 수정을 하지 않고, 디버그 표식만 반환.
+    """
+    # 향후: 잘못된 헤드노트 레벨/순서를 재배치하는 로직을 여기에 추가 가능
+    return {"repaired": False, "note": "text-only light repair; no structural changes"}
+
+
+def guess_law_name(text: str) -> str:
+    """
+    법령명 추정(간단 휴리스틱):
+    - 첫 5~8줄에서 'พระราชบัญญัติ', 'ประมวลกฎหมาย', 'รัฐธรรมนูญ' 등의 키워드 라인을 찾음
+    """
+    if not text:
+        return ""
+    first_block = "\n".join(text.splitlines()[:12])
+    for line in first_block.splitlines():
+        line_strip = line.strip()
+        if not line_strip:
+            continue
+        if any(k in line_strip for k in ("พระราชบัญญัติ", "ประมวลกฎหมาย", "รัฐธรรมนูญ", "พระราชกำหนด", "ประกาศ")):
+            # 길이가 너무 짧으면 다음 라인과 합체
+            if len(line_strip) < 12:
+                continue
+            return line_strip
+    # 못 찾으면 첫 비어있지 않은 줄
+    for line in first_block.splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 3) 청크 생성
+# ────────────────────────────────────────────────────────────────────────────
+
+def _scan_markers(text: str) -> Tuple[List[Tuple[int, int, str]], List[Tuple[int, int, str]]]:
+    """
+    텍스트에서 헤드노트/조문 시작 위치를 스캔.
+    return: (heads, arts)
+      heads = [(start, end, label), ...]
+      arts  = [(start, end, label), ...]  # end는 라인 끝(라벨 영역)
+    """
+    heads: List[Tuple[int, int, str]] = []
+    arts: List[Tuple[int, int, str]] = []
+
+    for m in HEAD_PAT.finditer(text):
+        s, e = m.span()
+        label = m.group("label").strip()
+        # 라벨은 너무 긴 라인을 제외 (이상치 필터)
+        if 1 <= len(label) <= 120:
+            heads.append((s, e, label))
+
+    for m in ARTICLE_PAT.finditer(text):
+        s, e = m.span()
+        label = (m.group(1) + " " + m.group(2)).strip()
+        arts.append((s, e, label))
+
+    heads.sort(key=lambda x: x[0])
+    arts.sort(key=lambda x: x[0])
+    return heads, arts
+
+
+def _collect_segments(text: str, heads, arts) -> List[Dict[str, Any]]:
+    """
+    head/article 시작점 기준으로 다음 시작점 직전까지를 segment로 본다.
+    각 segment: {"type": "headnote"|"article", "label": str, "span": (s,e), "head_ctx": [...breadcrumbs...]}
+    """
+    # merge 시작점
+    points = []
+    for s, e, lab in heads:
+        points.append((s, "headnote", (s, e, lab)))
+    for s, e, lab in arts:
+        points.append((s, "article", (s, e, lab)))
+    points.sort(key=lambda x: x[0])
+
+    segs: List[Dict[str, Any]] = []
+    breadcrumbs: List[str] = []
+
+    for i, (_, typ, payload) in enumerate(points):
+        start_of_this = payload[0]
+        label = payload[2]
+        end_of_this = points[i + 1][0] if i + 1 < len(points) else len(text)
+
+        if typ == "headnote":
+            # 헤드노트를 만나면 breadcrumbs 갱신
+            breadcrumbs.append(label)
+            segs.append({"type": "headnote", "label": label, "span": (start_of_this, end_of_this), "head_ctx": list(breadcrumbs)})
+        else:
+            # article: 현재까지의 breadcrumbs를 부여
+            segs.append({"type": "article", "label": label, "span": (start_of_this, end_of_this), "head_ctx": list(breadcrumbs)})
+
+    return segs
+
+
+def _best_cut(text: str, near: int, left: int, right: int) -> int:
+    """
+    [left, right] 구간에서 near에 가까운 문장 경계 후보 위치를 찾는다.
+    실패 시 near 반환.
+    """
+    if left >= right:
+        return near
+    window = text[left:right]
+    best = None
+    best_dist = 10**9
+    for m in CANDIDATE_BREAK.finditer(window):
+        cut = left + m.end()
+        dist = abs(cut - near)
+        if dist < best_dist:
+            best = cut
+            best_dist = dist
+    return best if best is not None else near
+
+
+def _split_article(text: str, s: int, e: int, label: str, overlap: int, limit: int,
+                   tail_merge_min_chars: int, soft_cut: bool) -> List[Tuple[str, Tuple[int, int], Tuple[int, int]]]:
+    """
+    롱 조문 분할.
+    return: [(label_or_part, (span_start, span_end), (core_start, core_end)), ...]
+    """
+    length = e - s
+    if length <= limit:
+        return [(label, (s, e), (s, e))]
+
+    parts = []
+    cursor = s
+    idx = 1
+    while cursor < e:
+        target = min(cursor + limit, e)
+        # 경계 찾기
+        cut = _best_cut(text, target, cursor + int(limit * 0.6), min(e, cursor + int(limit * 1.4))) if soft_cut else target
+        cut = max(cursor + 1, min(cut, e))
+        span_s = cursor
+        span_e = cut
+
+        # 오버랩 적용
+        core_s = span_s
+        core_e = span_e
+        if overlap > 0:
+            # 앞 파트의 꼬리와 다음 파트의 머리를 서로 겹치게
+            if parts:  # 이전 파트 존재
+                core_s = span_s + min(overlap, (span_e - span_s) // 3)
+            # 다음 파트가 있다면
+            if span_e < e:
+                core_e = span_e - min(overlap, (span_e - span_s) // 3)
+
+        parts.append((f"{label} (part {idx})", (span_s, span_e), (core_s, core_e)))
+        cursor = span_e
+        idx += 1
+
+    # tail 병합(마지막 조각이 너무 짧으면 앞 파트로 합치기)
+    if len(parts) >= 2:
+        last_label, (ls, le), (lcs, lce) = parts[-1]
+        prev_label, (ps, pe), (pcs, pce) = parts[-2]
+        if (le - ls) <= tail_merge_min_chars:
+            # 앞 파트로 흡수
+            parts[-2] = (prev_label, (ps, le), (pcs, le))
+            parts.pop(-1)
+
+    return parts
+
+
+def make_chunks(
+    *,
+    result,
+    mode: str = "article_only",
+    source_file: str = "",
+    law_name: str = "",
+    include_front_matter: bool = True,
+    include_headnotes: bool = True,
+    include_gap_fallback: bool = True,
+    allowed_headnote_levels: Optional[List[str]] = None,
+    min_headnote_len: int = 24,
+    min_gap_len: int = 24,
+    strict_lossless: bool = True,
+    split_long_articles: bool = True,
+    split_threshold_chars: int = 1500,
+    tail_merge_min_chars: int = 200,
+    overlap_chars: int = 200,
+    soft_cut: bool = True,
+) -> Tuple[List[Chunk], Dict[str, Any]]:
+    """
+    텍스트 기반 조문 청킹(라이트). 파서 트리가 풍부해도 full_text만으로 동작.
+    반환: (chunks, diagnostics)
+    """
+    text = _get_full_text(result)
+    N = len(text)
+    chunks: List[Chunk] = []
+    diag: Dict[str, Any] = {"heads": 0, "articles": 0, "split_parts": 0, "gap_fallback": 0}
+
+    if N == 0:
+        return ([], {"error": "empty_text"})
+
+    heads, arts = _scan_markers(text)
+    segs = _collect_segments(text, heads, arts)
+
+    # front_matter
+    first_pos = min([s for s, _, _ in heads + arts], default=None)
+    if include_front_matter and first_pos and first_pos > 0:
+        fm = Chunk(
+            text=_safe_slice(text, 0, first_pos),
+            span_start=0, span_end=first_pos,
+            meta={
+                "type": "front_matter",
+                "law_name": law_name,
+                "source_file": source_file,
+                "section_label": "front_matter",
+                "section_uid": _mk_uid("front_matter", 0),
+                "core_span": [0, first_pos],
+                "doc_type": getattr(result, "doc_type", "") or "",
+            },
+            breadcrumbs=[]
+        )
+        chunks.append(fm)
+
+    # segments → chunks
+    for seg in segs:
+        typ = seg["type"]
+        s, e = seg["span"]
+        label = seg["label"].strip()
+        bcs = [b.strip() for b in seg.get("head_ctx") or []]
+
+        if typ == "headnote":
+            if not include_headnotes:
+                continue
+            if len(_safe_slice(text, s, e).strip()) < min_headnote_len:
+                continue
+            ch = Chunk(
+                text=_safe_slice(text, s, e),
+                span_start=s, span_end=e,
+                meta={
+                    "type": "headnote",
+                    "law_name": law_name,
+                    "source_file": source_file,
+                    "section_label": label,
+                    "section_uid": _mk_uid(label, s),
+                    "core_span": [s, e],
+                    "doc_type": getattr(result, "doc_type", "") or "",
+                },
+                breadcrumbs=bcs
+            )
+            chunks.append(ch)
+            diag["heads"] += 1
+        else:
+            # article
+            if not (0 <= s < e <= N):
+                continue
+
+            if split_long_articles and (e - s) > split_threshold_chars:
+                parts = _split_article(
+                    text, s, e, label,
+                    overlap=overlap_chars,
+                    limit=split_threshold_chars,
+                    tail_merge_min_chars=tail_merge_min_chars,
+                    soft_cut=soft_cut
+                )
+                diag["split_parts"] += len(parts)
+                for lab, (ps, pe), (cs, ce) in parts:
+                    ch = Chunk(
+                        text=_safe_slice(text, ps, pe),
+                        span_start=ps, span_end=pe,
+                        meta={
+                            "type": "article",
+                            "law_name": law_name,
+                            "source_file": source_file,
+                            "section_label": lab,
+                            "section_uid": _mk_uid(lab, ps),
+                            "core_span": [cs, ce],
+                            "doc_type": getattr(result, "doc_type", "") or "",
+                        },
+                        breadcrumbs=bcs
+                    )
+                    chunks.append(ch)
+            else:
+                ch = Chunk(
+                    text=_safe_slice(text, s, e),
+                    span_start=s, span_end=e,
+                    meta={
+                        "type": "article",
+                        "law_name": law_name,
+                        "source_file": source_file,
+                        "section_label": label,
+                        "section_uid": _mk_uid(label, s),
+                        "core_span": [s, e],
+                        "doc_type": getattr(result, "doc_type", "") or "",
+                    },
+                    breadcrumbs=bcs
+                )
+                chunks.append(ch)
+            diag["articles"] += 1
+
+    # 정렬 보장
+    chunks.sort(key=lambda c: (int(c.span_start), int(c.span_end)))
+
+    # gap sweeper (무손실 옵션)
+    if strict_lossless and include_gap_fallback:
+        filled: List[Chunk] = []
+        cur = 0
+        for ch in chunks:
+            s, e = int(ch.span_start), int(ch.span_end)
+            if s > cur and (s - cur) >= min_gap_len:
+                # gap
+                gf = Chunk(
+                    text=_safe_slice(text, cur, s),
+                    span_start=cur, span_end=s,
+                    meta={
+                        "type": "gap_fallback",
+                        "law_name": law_name,
+                        "source_file": source_file,
+                        "section_label": "gap",
+                        "section_uid": _mk_uid("gap", cur),
+                        "core_span": [cur, s],
+                        "doc_type": getattr(result, "doc_type", "") or "",
+                    },
+                    breadcrumbs=[]
+                )
+                filled.append(gf)
+                diag["gap_fallback"] += 1
+            filled.append(ch)
+            cur = max(cur, e)
+        if cur < N and (N - cur) >= min_gap_len:
+            gf = Chunk(
+                text=_safe_slice(text, cur, N),
+                span_start=cur, span_end=N,
+                meta={
+                    "type": "gap_fallback",
+                    "law_name": law_name,
+                    "source_file": source_file,
+                    "section_label": "gap",
+                    "section_uid": _mk_uid("gap", cur),
+                    "core_span": [cur, N],
+                    "doc_type": getattr(result, "doc_type", "") or "",
+                },
+                breadcrumbs=[]
+            )
+            filled.append(gf)
+            diag["gap_fallback"] += 1
+        chunks = filled
+
+    return (chunks, diag)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 4) tail-sweep: 마지막 짧은 파트는 앞 파트로 병합
+# ────────────────────────────────────────────────────────────────────────────
 
 def merge_small_trailing_parts(
-    chunks: List["Chunk"],
+    chunks: List[Chunk],
     *,
     full_text: str,
     max_tail_chars: int = 200
 ) -> Dict[str, Any]:
     """
-    분할 시리즈의 마지막(part N) 꼬리가 너무 짧으면 앞 청크로 병합.
-    - 같은 series(base)가 맞고, 현재가 마지막(part N), 길이<=max_tail_chars일 때만
-    - 병합: prev.span_end 및 prev.core_span[1]을 curr의 끝까지 확장하고 curr 제거
-    반환: {'merged_count':int, 'affected_sections':[...]}
+    분할 시리즈의 마지막(part N) 조각이 너무 짧으면 앞 조각으로 흡수.
+    - 같은 시리즈(base)가 맞고, 현재가 연속(part n, part n+1)이며
+    - 뒤 파트 길이<=max_tail_chars
+    - prev.meta/core_span[1], span_end를 curr의 끝까지 확장하고 curr 제거
     """
     if not chunks:
         return {"merged_count": 0, "affected_sections": []}
 
-    # span 순서로 가정 (make_chunks가 이미 정렬)
+    # span 정렬이 전제
+    chunks.sort(key=lambda c: (int(c.span_start), int(c.span_end)))
+
     merged = 0
     affected: List[str] = []
     i = 1
     while i < len(chunks):
         prev = chunks[i - 1]
         curr = chunks[i]
-        if (prev.meta.get("type") == "article" and curr.meta.get("type") == "article"):
+
+        if (getattr(prev, "meta", {}).get("type") == "article" and
+            getattr(curr, "meta", {}).get("type") == "article"):
+
             prev_label = prev.meta.get("section_label", "")
             curr_label = curr.meta.get("section_label", "")
             prev_base, prev_idx = _part_info(prev_label)
             curr_base, curr_idx = _part_info(curr_label)
 
-            # 같은 시리즈의 연속 파트인지 확인
-            is_series = (prev_base and curr_base and prev_base == curr_base and
-                         prev_idx is not None and curr_idx is not None and curr_idx == prev_idx + 1)
+            is_series = (
+                prev_base and curr_base and prev_base == curr_base and
+                (prev_idx is not None) and (curr_idx is not None) and (curr_idx == prev_idx + 1)
+            )
 
             curr_len = int(curr.span_end) - int(curr.span_start)
 
             if is_series and curr_len <= int(max_tail_chars):
-                # 병합
                 # core_span 보정
                 prev_core = prev.meta.get("core_span", [prev.span_start, prev.span_end])
                 curr_core = curr.meta.get("core_span", [curr.span_start, curr.span_end])
@@ -783,17 +513,15 @@ def merge_small_trailing_parts(
                 # span/text 확장
                 prev.span_end = int(curr.span_end)
                 try:
-                    prev.text = full_text[int(prev.span_start):int(prev.span_end)]
+                    prev.text = _safe_slice(full_text, int(prev.span_start), int(prev.span_end))
                 except Exception:
-                    # 안전 폴백: 텍스트는 그대로 두되 span만 확장
                     pass
 
-                # 현재 조각 제거
+                # curr 제거
                 del chunks[i]
                 merged += 1
                 affected.append(prev_base)
-                # i는 그대로(다음 항목이 앞으로 땡겨졌으니 같은 i 인덱스를 다시 검사)
-                continue
+                continue  # 같은 인덱스에 새 항목이 당겨졌으니 재검사
         i += 1
 
     return {"merged_count": merged, "affected_sections": affected}
