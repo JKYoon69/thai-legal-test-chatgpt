@@ -3,39 +3,41 @@ import time, json
 from typing import List, Dict, Any, Tuple
 import streamlit as st
 
+# ---- 기존 파서/후처리/출력 모듈은 그대로 사용 (repo에 이미 있음) ----
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import validate_tree, make_chunks, guess_law_name, repair_tree
 from parser_core.schema import ParseResult, Chunk
 from exporters.writers import to_jsonl, make_debug_report
 
+# ---- LLM 어댑터 ----
 from llm_clients import call_openai_41mini, call_openai_gpt5, call_gemini_flash
 from jsonschema import validate as json_validate, ValidationError
 
 APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
 
 # ---------- Schemas (LLM 구조적 출력 검증) ----------
+# 스키마를 약간 느슨하게 두고(추후 단계적 강화) schema_validation_failed 빈도를 줄입니다.
 LAW_SCHEMA = {
     "type": "object",
     "properties": {
-        "doc_type": {"type": "string", "enum": ["act", "code", "regulation", "constitution", "unknown"]},
-        "law_name": {"type": "string"},
-        "year_be": {"type": ["string", "null"]},
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "notes": {"type": "string"}
+        "doc_type":   {"type": "string"},  # act|code|regulation|constitution|unknown (모델 프롬프트로 유도)
+        "law_name":   {"type": "string"},
+        "year_be":    {"type": ["string", "null"]},
+        "confidence": {"type": "number"}
     },
     "required": ["doc_type", "law_name", "confidence"],
-    "additionalProperties": False
+    "additionalProperties": True
 }
 DESC_SCHEMA = {
     "type": "object",
     "properties": {
-        "brief": {"type": "string", "maxLength": 180},
-        "topics": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 6},
-        "negations": {"type": "array", "items": {"type": "string"}, "minItems": 0, "maxItems": 4},
-        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+        "brief": {"type": "string"},
+        "topics": {"type": "array", "items": {"type": "string"}},
+        "negations": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number"}
     },
     "required": ["brief", "topics", "confidence"],
-    "additionalProperties": False
+    "additionalProperties": True
 }
 
 # ---------- CSS ----------
@@ -134,19 +136,18 @@ class RunPanel:
             self.prog = st.progress(0, text="대기 중")
             self.lines = st.container()
         self.t0 = time.time()
-        self.total_weight = 100
         self.done = 0
-    def _update_prog(self, label, inc=None, set_to=None):
+    def _update(self, label, inc=None, set_to=None):
         if set_to is not None: self.done=set_to
         elif inc is not None: self.done=min(100, self.done+inc)
         self.prog.progress(int(self.done), text=f"{label} · {int(self.done)}%")
     def step(self, label, state="running"): self.status.update(label=label, state=state)
     def log(self, text): 
         with self.lines: st.markdown(f"- {text}")
-    def done_step(self, label, inc): self._update_prog(label, inc=inc)
+    def tick(self, label, inc): self._update(label, inc=inc)
     def finalize(self, ok=True):
         self.status.update(label=f"완료 · {time.time()-self.t0:.1f}s", state=("complete" if ok else "error"))
-        self._update_prog("완료", set_to=100)
+        self._update("완료", set_to=100)
 
 # ---------- LLM helper ----------
 def _force_json(s: str) -> Dict[str,Any] | None:
@@ -158,7 +159,7 @@ def _force_json(s: str) -> Dict[str,Any] | None:
         except Exception: return None
     return None
 
-def _llm_try_models_for_json(prompt: str, schema: Dict[str,Any], *, diag_prefix:str) -> Tuple[Dict[str,Any] | None, Dict[str,Any]]:
+def _llm_try_models_for_json(prompt: str, schema: Dict[str,Any]) -> Tuple[Dict[str,Any] | None, Dict[str,Any]]:
     """4.1-mini(스키마 강제) → 실패시 4.1-mini 평문 → Gemini → gpt-5 순으로 시도"""
     diag={"route":[], "errors":[]}
 
@@ -260,7 +261,7 @@ def main():
             doc_type = detect_doc_type(text)
             result: ParseResult = parse_document(text, doc_type=doc_type)
             panel.log(f"파싱 완료 · {time.time()-t0:.2f}s, doc_type={doc_type}")
-            panel.done_step("파싱", inc=20)
+            panel.tick("파싱", inc=20)
 
             # 2) 수복/검증
             panel.step("2/6 트리 수복/검증")
@@ -269,7 +270,7 @@ def main():
             rep_diag = repair_tree(result)
             issues_after = validate_tree(result)
             panel.log(f"수복 전 이슈={len(issues_before)} → 후={len(issues_after)} · {time.time()-t0:.2f}s")
-            panel.done_step("트리 수복", inc=10)
+            panel.tick("트리 수복", inc=10)
 
             # 3) 청킹
             panel.step("3/6 청킹")
@@ -287,7 +288,7 @@ def main():
                 soft_cut=True
             )
             panel.log(f"청크 {len(chunks)}개 생성 · {time.time()-t0:.2f}s")
-            panel.done_step("청킹", inc=20)
+            panel.tick("청킹", inc=20)
 
             # 4) LLM 메타 (법령명/유형)
             final_doc_type = result.doc_type or "unknown"
@@ -306,7 +307,7 @@ def main():
                     "ห้ามคาดเดาเกินเนื้อหา ตอบ JSON เท่านั้น\n\n"
                     f"<document>\n{text[:1600]}\n</document>"
                 )
-                obj, diag = _llm_try_models_for_json(prompt, LAW_SCHEMA, diag_prefix="law")
+                obj, diag = _llm_try_models_for_json(prompt, LAW_SCHEMA)
                 llm_log["law"]=diag
                 if obj:
                     final_doc_type = obj.get("doc_type") or final_doc_type
@@ -316,7 +317,7 @@ def main():
                 panel.log("LLM 메타 완료")
             else:
                 panel.log("LLM 메타: 비활성화")
-            panel.done_step("LLM 메타", inc=10)
+            panel.tick("LLM 메타", inc=10)
 
             # 5) LLM 설명자 (조문 요약/주제어)
             if st.session_state["use_llm_desc"]:
@@ -337,18 +338,18 @@ def main():
                         f"<breadcrumbs>{' / '.join(c.breadcrumbs or [])}</breadcrumbs>\n"
                         f"<document>\n{core[:1600]}\n</document>"
                     )
-                    obj, d = _llm_try_models_for_json(prompt, DESC_SCHEMA, diag_prefix="desc")
+                    obj, d = _llm_try_models_for_json(prompt, DESC_SCHEMA)
                     if obj:
                         c.meta["brief"]=obj.get("brief","")
                         c.meta["topics"]=obj.get("topics",[])
                         c.meta["negations"]=obj.get("negations",[])
                     else:
                         llm_errors += [f'desc:{e.get("m")}:{e.get("e")}' for e in d.get("errors",[])]
-                    panel.done_step("LLM 설명자", inc=per)
+                    panel.tick("LLM 설명자", inc=per)
                 llm_log["desc"]={"errors":llm_errors}
             else:
                 panel.log("LLM 설명자: 비활성화")
-                panel.done_step("LLM 설명자", inc=30)
+                panel.tick("LLM 설명자", inc=30)
 
             st.session_state["llm_errors"] = llm_errors
 
@@ -396,7 +397,7 @@ def main():
                 "issues":issues_after, "report_json_str":report_str, "chunks_jsonl_str":chunks_str
             })
 
-            panel.done_step("리포트/렌더", inc=10)
+            panel.tick("리포트/렌더", inc=10)
             panel.finalize(ok=True)
 
         except Exception as e:

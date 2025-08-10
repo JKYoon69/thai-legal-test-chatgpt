@@ -2,7 +2,7 @@
 """
 LLM 통합 클라이언트:
 - OpenAI Responses API (gpt-4.1-mini-2025-04-14, gpt-5)
-- Google Gemini (gemini-2.5-flash, google-genai SDK)
+- Google Gemini (gemini-2.5-flash; google-genai SDK)
 - Streamlit Secrets 우선, 없으면 환경변수 사용
 """
 
@@ -32,7 +32,7 @@ def _openai_client() -> OpenAI:
         _openai = OpenAI(api_key=key)
     return _openai
 
-def openai_responses_call(
+def _openai_responses(
     model: str,
     prompt: str,
     *,
@@ -46,7 +46,7 @@ def openai_responses_call(
     kwargs: Dict[str, Any] = {
         "model": model,
         "input": prompt,
-        "max_output_tokens": max_output_tokens,
+        "max_output_tokens": max_output_tokens,  # Responses API는 max_output_tokens 사용
     }
     if instructions:
         kwargs["instructions"] = instructions
@@ -75,25 +75,32 @@ def openai_responses_call(
     except Exception as e:
         return {"ok": False, "error": f"openai:{model}:{type(e).__name__}:{e}"}
 
+    # 공식 SDK 헬퍼 우선
     text = getattr(resp, "output_text", None)
     if not text:
-        # 중간 버전 폴백
+        # 안전 폴백: 하위 content에서 텍스트 모으기
+        pieces = []
         try:
-            text = "\n".join([b.content[0].text for b in getattr(resp, "output", []) if getattr(b, "content", None)])
+            for item in getattr(resp, "output", []) or []:
+                if getattr(item, "content", None):
+                    for part in item.content:
+                        if getattr(part, "text", None):
+                            pieces.append(part.text)
         except Exception:
-            text = None
+            pass
+        text = "\n".join(pieces) if pieces else None
 
     if not text:
-        return {"ok": False, "error": "openai:empty_output_text", "raw": resp}
+        return {"ok": False, "error": "openai:empty_output_text", "raw": None}
 
-    return {"ok": True, "text": text, "raw": resp}
+    return {"ok": True, "text": text, "raw": None}
 
 
 def call_openai_41mini(prompt: str, *, schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return openai_responses_call(
+    return _openai_responses(
         model="gpt-4.1-mini-2025-04-14",
         prompt=prompt,
-        instructions="Return concise Thai legal metadata/summary as requested.",
+        instructions="Return concise Thai legal metadata/summary as requested (JSON only when asked).",
         max_output_tokens=512,
         temperature=0.2,
         json_schema=schema,
@@ -101,10 +108,10 @@ def call_openai_41mini(prompt: str, *, schema: Optional[Dict[str, Any]] = None) 
 
 def call_openai_gpt5(prompt: str) -> Dict[str, Any]:
     # temperature 금지, max_output_tokens만 사용
-    return openai_responses_call(
+    return _openai_responses(
         model="gpt-5",
         prompt=prompt,
-        instructions="Return concise Thai legal metadata/summary as requested.",
+        instructions="Return concise Thai legal metadata/summary as requested (JSON only when asked).",
         max_output_tokens=512,
         temperature=None,
         json_schema=None,
@@ -118,6 +125,7 @@ except Exception:
     _gemini = None
 
 def call_gemini_flash(prompt: str) -> Dict[str, Any]:
+    """Gemini 2.5 Flash 안전 호출. response.text → parts → model_dump 순서로 텍스트 확보."""
     if _gemini is None:
         return {"ok": False, "error": "gemini:client_not_initialized"}
 
@@ -127,22 +135,35 @@ def call_gemini_flash(prompt: str) -> Dict[str, Any]:
             contents=prompt,
             config={"max_output_tokens": 512},
         )
-        # finish_reason이 STOP(=1)일 때만 quick accessor 신뢰
-        cand = resp.candidates[0] if resp.candidates else None
-        finish = getattr(cand, "finish_reason", None)
-        text = getattr(resp, "text", None) if finish == 1 else None
 
-        if not text:
-            # dict로 펼쳐서 Part에서 텍스트 추출
-            data = resp.to_dict()
-            try:
-                text = data["candidates"][0]["content"]["parts"][0].get("text", "")
-            except Exception:
-                text = ""
+        # 1) quick accessor
+        if getattr(resp, "text", None):
+            return {"ok": True, "text": resp.text, "raw": None}
 
-        if not text:
-            return {"ok": False, "error": f"gemini:no_text (finish_reason={finish})"}
+        # 2) candidates/parts
+        try:
+            cand = resp.candidates[0] if resp.candidates else None
+            parts = cand.content.parts if cand and cand.content and cand.content.parts else []
+            for p in parts:
+                if getattr(p, "text", None):
+                    return {"ok": True, "text": p.text, "raw": None}
+        except Exception:
+            pass
 
-        return {"ok": True, "text": text, "raw": None}
+        # 3) 전체 직렬화 후 텍스트 키 탐색 (Pydantic model → dict)
+        try:
+            data = resp.model_dump()
+            # 매우 보수적 폴백
+            txt = (
+                data.get("text")
+                or ((data.get("candidates") or [{}])[0].get("content") or {}).get("parts", [{}])[0].get("text")
+                or ""
+            )
+            if txt:
+                return {"ok": True, "text": txt, "raw": None}
+        except Exception:
+            pass
+
+        return {"ok": False, "error": "gemini:no_text"}
     except Exception as e:
         return {"ok": False, "error": f"gemini:{type(e).__name__}:{e}"}
