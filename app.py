@@ -2,18 +2,36 @@
 import io
 import json
 import time
-from typing import List, Optional, Tuple
+from typing import List
 
 import streamlit as st
 
-from parser import detect_doc_type, parse_document
-from postprocess import (
-    validate_tree,
-    make_chunks,
-    guess_law_name,
-)
-from schema import ParseResult, Node, Chunk
-import writers as wr
+# ─────────────────────────────────────────────
+# Import fallbacks: try package path, then flat files
+# ─────────────────────────────────────────────
+try:
+    # 패키지 구조: parser_core/*
+    from parser_core.parser import detect_doc_type, parse_document
+    from parser_core.postprocess import validate_tree, make_chunks, guess_law_name
+    from parser_core.schema import ParseResult, Node, Chunk
+    import exporters.writers as wr
+    IMPORT_FLAVOR = "parser_core/*"
+except Exception:
+    try:
+        # 평면 파일 구조: 같은 디렉토리의 *.py
+        from parser import detect_doc_type, parse_document
+        from postprocess import validate_tree, make_chunks, guess_law_name
+        from schema import ParseResult, Node, Chunk
+        import writers as wr
+        IMPORT_FLAVOR = "flat *.py"
+    except Exception as e:
+        # 에러 메시지를 명확히
+        raise ImportError(
+            "Cannot import parsing modules. Expected either:\n"
+            "  - parser_core/{parser,postprocess,schema}.py + exporters/writers.py\n"
+            "  - or flat files {parser,postprocess,schema,writers}.py in the app root.\n"
+            f"Original import error: {e}"
+        ) from e
 
 APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
 
@@ -28,15 +46,6 @@ def _inject_css():
                      background: var(--background-color); border-bottom: 1px solid rgba(128,128,128,.25); }
           .code-like { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: pre-wrap; }
           mark { background: #fff3bf; padding: 0 .15rem; border-radius: .2rem; }
-          .tree-pane { font-size: .95rem; line-height: 1.25rem; }
-          .tree-row { display: flex; align-items: center; gap: .5rem; margin: .1rem 0; }
-          .tree-label { padding: .1rem .25rem; border-radius: .35rem; }
-          .indent { height: 1px; width: var(--indent, 0px); }
-          .badge { background: #e7f5ff; border: 1px solid #d0ebff; padding: .05rem .35rem; border-radius: .5rem; font-size: .72rem; }
-          @media (prefers-color-scheme: dark){
-            .badge { background: rgba(56, 139, 253,.15); border-color: rgba(56,139,253,.35); }
-            .tree-label{ background: rgba(255,255,255,.06); }
-          }
         </style>
         """,
         unsafe_allow_html=True,
@@ -52,15 +61,15 @@ def _ensure_state():
         "result": None,
         "chunks": [],
         "issues": [],
-        "sel_id": None,
         "mode": "article_only",
-        # lossless / noise control options (REPORT에 기록)
+        # REPORT에 기록되는 손실 방지/노이즈 억제 옵션
         "include_front_matter": True,
         "include_headnotes": True,
         "include_gap_fallback": True,
-        "allowed_headnote_levels": ["ภาค","ลักษณะ","หมวด","ส่วน","บท"],  # 과다 생성 방지시 줄이기
-        "min_headnote_len": 24,   # 너무 짧은 머리말은 노이즈
-        "min_gap_len": 24,        # 자잘한 gap은 버림
+        "allowed_headnote_levels": ["ภาค","ลักษณะ","หมวด","ส่วน","บท"],
+        "min_headnote_len": 24,
+        "min_gap_len": 24,
+        "show_raw": False,
     }.items():
         st.session_state.setdefault(k, v)
 
@@ -75,25 +84,22 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
     covered = sum(e - s for s, e in merged)
     return (covered / total_len) if total_len else 0.0
 
-# ───────────────────────────────── App ───────────────────────────────── #
-
 def main():
     _inject_css()
     _ensure_state()
 
     st.title(APP_TITLE)
-    st.caption("Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
+    st.caption(f"Imports: **{IMPORT_FLAVOR}**  ·  Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
 
-    # inputs
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
 
     colA, colB, colC = st.columns(3)
     with colA:
         st.session_state["mode"] = st.selectbox("청크 모드", options=["article_only"], index=0)
     with colB:
-        show_raw = st.checkbox("원문(raw) 보기", value=False)
+        st.session_state["show_raw"] = st.checkbox("원문(raw) 보기", value=st.session_state["show_raw"])
     with colC:
-        pass
+        st.write("")  # spacer
 
     st.markdown("**손실 방지 / 노이즈 억제 옵션 (REPORT에 기록됩니다)**")
     oc1, oc2, oc3 = st.columns(3)
@@ -103,7 +109,6 @@ def main():
         st.session_state["include_headnotes"] = st.checkbox("headnote 포함", value=st.session_state["include_headnotes"])
     with oc3:
         st.session_state["include_gap_fallback"] = st.checkbox("gap-sweeper 포함", value=st.session_state["include_gap_fallback"])
-
     sc1, sc2 = st.columns(2)
     with sc1:
         st.session_state["min_headnote_len"] = st.number_input("headnote 최소 길이(문자)", min_value=0, max_value=400, value=st.session_state["min_headnote_len"])
@@ -112,7 +117,7 @@ def main():
 
     parse_clicked = st.button("파싱")
 
-    # load text to state on upload
+    # 파일 적재
     if uploaded is not None:
         try:
             st.session_state["text"] = uploaded.read().decode("utf-8")
@@ -159,16 +164,16 @@ def main():
         )
         t5 = time.time()
 
-        # store
-        st.session_state["doc_type"] = doc_type
-        st.session_state["law_name"] = law_name
-        st.session_state["result"] = result
-        st.session_state["chunks"] = chunks
-        st.session_state["issues"] = issues
-        st.session_state["parsed"] = True
-        st.session_state["sel_id"] = None
+        st.session_state.update({
+            "doc_type": doc_type,
+            "law_name": law_name,
+            "result": result,
+            "chunks": chunks,
+            "issues": issues,
+            "parsed": True,
+        })
 
-        # run config / debug → REPORT
+        # REPORT에 기록할 실행 설정/디버그
         st.session_state["run_config"] = {
             "mode": st.session_state["mode"],
             "include_front_matter": st.session_state["include_front_matter"],
@@ -177,6 +182,7 @@ def main():
             "allowed_headnote_levels": list(st.session_state["allowed_headnote_levels"]),
             "min_headnote_len": int(st.session_state["min_headnote_len"]),
             "min_gap_len": int(st.session_state["min_gap_len"]),
+            "import_flavor": IMPORT_FLAVOR,
         }
         st.session_state["debug"] = {
             "timings_sec": {
@@ -223,7 +229,12 @@ def main():
                                    mime="application/zip", key="dl-zip-top")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        st.info("NOTE: REPORT.json에 실행 옵션, 커버리지/중복/겹침/트리 무결성, 갭 프리뷰가 모두 기록됩니다.")
+        # 원문 미리보기 (간단)
+        if st.session_state["show_raw"]:
+            st.subheader("원문 미리보기")
+            st.markdown(f"<div class='code-like'>{st.session_state['text'][:2000]}</div>", unsafe_allow_html=True)
+        if st.session_state["issues"]:
+            st.caption(f"검증 경고: {len(st.session_state['issues'])}건 (REPORT.json에 상세 기록됨)")
     else:
         st.info("파일을 올린 뒤 **[파싱]** 버튼을 눌러주세요.")
 
