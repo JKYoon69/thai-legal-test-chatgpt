@@ -157,6 +157,7 @@ def make_chunks(
     Strict 모드:
       - headnote/gap 길이 필터 비활성
       - 모든 정리 후 post-fill로 남은 간극을 orphan_gap으로 보강(공백-only 포함)
+    + 이번 패치: '제거 사유'를 세분화해 diag에 누적 기록
     """
     text = result.full_text
     total_len = len(text)
@@ -164,7 +165,14 @@ def make_chunks(
     diag: Dict[str, Any] = {
         "headnote_candidates": 0,
         "headnote_after_filter": 0,
-        "short_headnotes_removed": 0,
+        "final_headnote_count": 0,
+        "removals": {
+            "removed_short": 0,
+            "removed_same_span_dedupe": 0,
+            "removed_overlap_clip_to_zero": 0,
+            "removed_empty_text": 0,
+            "removed_invalid_span": 0,
+        },
         "strict_post_fill": {"enabled": bool(strict_lossless), "filled_gaps": 0, "total_chars": 0, "spans": []},
         "allowed_headnote_levels_effective": list(allowed_headnote_levels) + ["บท* (prefix)"],
     }
@@ -263,7 +271,7 @@ def make_chunks(
                                             node_ids=[parent.node_id], breadcrumbs=crumbs, meta=meta))
                         diag["headnote_after_filter"] += 1
                     else:
-                        diag["short_headnotes_removed"] += 1
+                        diag["removals"]["removed_short"] += 1
             for c in parent.children:
                 walk(c)
         walk(result.root)
@@ -278,7 +286,9 @@ def make_chunks(
             prev = e
         if prev < total_len: gaps.append((prev, total_len))
         for idx, (s, e) in enumerate(gaps, 1):
-            if e <= s: continue
+            if e <= s:
+                diag["removals"]["removed_invalid_span"] += 1
+                continue
             frag = text[s:e]
             keep = (e - s) > 0 if strict_lossless else (len(frag.strip()) >= min_gap_len)
             if keep:
@@ -294,16 +304,21 @@ def make_chunks(
                 }
                 chunks.append(Chunk(text=frag, span_start=s, span_end=e,
                                     node_ids=[], breadcrumbs=_find_path_at_offset(result, s), meta=meta))
+            else:
+                diag["removals"]["removed_short"] += 1  # gap이 너무 짧아 버림(Strict OFF)
 
-    # ── 정리: 정렬 → 동기화 → 동일구간 dedupe → 연속 겹침 클립 ── #
+    # ── 정리: 정렬 → 동기화 → 동일스팬 dedupe → 전방클립 ── #
     chunks.sort(key=lambda c: (c.span_start, c.span_end))
 
     cleaned: List[Chunk] = []
     for c in chunks:
         s, e = c.span_start, c.span_end
-        if s is None or e is None or e <= s: continue
+        if s is None or e is None or e <= s:
+            diag["removals"]["removed_invalid_span"] += 1
+            continue
         c.text = text[s:e]  # 원문 재동기화
         if not strict_lossless and c.text.strip() == "":
+            diag["removals"]["removed_empty_text"] += 1
             continue
         cleaned.append(c)
     chunks = cleaned
@@ -312,7 +327,9 @@ def make_chunks(
     dedup1: List[Chunk] = []
     for c in chunks:
         key = (c.span_start, c.span_end)
-        if key in seen_span: continue
+        if key in seen_span:
+            diag["removals"]["removed_same_span_dedupe"] += 1
+            continue
         seen_span.add(key)
         dedup1.append(c)
     chunks = dedup1
@@ -323,22 +340,25 @@ def make_chunks(
         s, e = c.span_start, c.span_end
         if last_end > -1 and s < last_end:
             s = last_end  # 전방 클립
-        if e - s <= 0:
-            continue
+            if e - s <= 0:
+                diag["removals"]["removed_overlap_clip_to_zero"] += 1
+                continue
 
-        # 🔧 핵심 수정: Strict일 때는 headnote/gap/front_matter 길이 필터 완전 비활성화
+        # Strict일 때는 길이 필터 완전 비활성화
         if not strict_lossless:
             if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
                 thr = min_headnote_len if c.meta.get("type") == "headnote" else min_gap_len
                 if (e - s) < thr:
-                    if c.meta.get("type") == "headnote":
-                        diag["short_headnotes_removed"] += 1
+                    diag["removals"]["removed_short"] += 1
                     continue
 
         c.span_start, c.span_end = s, e
         c.text = text[s:e]
         final.append(c)
         last_end = e
+
+    # headnote 최종 개수 기록
+    diag["final_headnote_count"] = sum(1 for c in final if c.meta.get("type") == "headnote")
 
     # ── Strict 전용 post-fill ── #
     if strict_lossless:
@@ -351,7 +371,9 @@ def make_chunks(
         if prev < total_len: post_gaps.append((prev, total_len))
 
         for (s, e) in post_gaps:
-            if e <= s: continue
+            if e <= s:
+                diag["removals"]["removed_invalid_span"] += 1
+                continue
             frag = text[s:e]   # 공백-only라도 포함
             meta = {
                 "type": "orphan_gap",

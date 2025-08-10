@@ -24,9 +24,15 @@ def to_jsonl(chunks: List[Chunk]) -> str:
         lines.append(json.dumps(obj, ensure_ascii=False))
     return "\n".join(lines)
 
-def make_zip_bundle(source_text: str, parse_result: ParseResult, chunks: List[Chunk],
-                    source_file: str, law_name: str, run_config: Dict[str, Any] | None = None,
-                    debug: Dict[str, Any] | None = None) -> io.BytesIO:
+def make_zip_bundle(
+    source_text: str,
+    parse_result: ParseResult,
+    chunks: List[Chunk],
+    source_file: str,
+    law_name: str,
+    run_config: Dict[str, Any] | None = None,
+    debug: Dict[str, Any] | None = None,
+) -> io.BytesIO:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("SOURCE.txt", source_text)
@@ -173,7 +179,15 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
 
     mk_diag = (debug or {}).get("make_chunks_diag", {}) if debug else {}
     strict_post_fill = mk_diag.get("strict_post_fill", {"enabled": False, "filled_gaps": 0, "total_chars": 0, "spans": []})
-    short_headnotes_removed = mk_diag.get("short_headnotes_removed", 0)
+
+    # 회계(제거 사유) 정리
+    removals = mk_diag.get("removals", {})
+    headnote_candidates = mk_diag.get("headnote_candidates", 0)
+    headnote_after_filter = mk_diag.get("headnote_after_filter", 0)
+    final_headnote_count = mk_diag.get("final_headnote_count", 0)
+    removed_total = sum(removals.values()) if isinstance(removals, dict) else 0
+    # 합계 검증(참고용): 후보 → (필터 통과) → (최종)
+    accounting_ok = (final_headnote_count <= headnote_after_filter)  # 최종 단계에서 dedupe/클립으로 더 빠질 수 있음
 
     report = {
         "source_file": source_file,
@@ -199,8 +213,18 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
             "chunk_article_count": sum(1 for c in chunks if c.meta.get("type","article")=="article")
         },
         "article_size_stats": _article_size_stats(chunks),
+        # ── 새 섹션: 파이프라인 회계 ── #
+        "pipeline_accounting": {
+            "headnote": {
+                "candidates": headnote_candidates,
+                "kept_after_filter": headnote_after_filter,
+                "final_in_chunks": final_headnote_count,
+            },
+            "removals_by_reason": removals,
+            "removed_total_estimate": removed_total,
+            "consistency_check_ok": accounting_ok,
+        },
         "strict_post_fill": strict_post_fill,
-        "short_headnotes_removed": short_headnotes_removed,
         "sample_chunk_head": (chunks[0].text[:400] if chunks else ""),
         "debug": debug or {},
         "timestamp": datetime.utcnow().isoformat() + "Z",
