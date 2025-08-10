@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import time, json
-from typing import List, Dict, Any
+from typing import List
 import streamlit as st
 
 from parser_core.parser import detect_doc_type, parse_document
@@ -9,18 +9,17 @@ from parser_core.schema import ParseResult, Chunk
 from exporters.writers import to_jsonl, make_debug_report
 from llm_adapter import LLMRouter
 
-APP_TITLE = "Thai Legal Preprocessor — LLM + Overlap Visual (v2)"
+APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
 
-# ───────── CSS ───────── #
+# ---------- CSS ----------
 def _inject_css():
     st.markdown("""
     <style>
-      .block-container { max-width: 1400px !important; padding-top: .75rem; }
+      .block-container { max-width: 1400px !important; padding-top: .6rem; }
       .docwrap { border:1px solid rgba(107,114,128,.25); border-radius:10px; padding:16px; }
       .doc { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
              font-size:13.5px; line-height:1.6; position:relative; }
-
-      /* 전체 청크(연두 중괄호) */
+      /* 청크 전체(연두 괄호) */
       .chunk-wrap { position:relative; padding:0 12px; border-radius:6px; margin:0 1px; }
       .chunk-wrap::before, .chunk-wrap::after {
         content:"{"; position:absolute; top:-1px; bottom:-1px; width:10px;
@@ -28,14 +27,12 @@ def _inject_css():
       }
       .chunk-wrap::before { left:0; }
       .chunk-wrap::after  { right:0; transform:scaleX(-1); }
-
-      /* 오버랩(연핑크 배경 + 얇은 핑크 중괄호) */
-      .overlap { background: rgba(244,114,182,.22); }   /* pink-400 @ 22% */
+      /* 오버랩(연핑크 배경 + 얇은 핑크 괄호) */
+      .overlap { background: rgba(244,114,182,.22); }
       .overlap-mark { color:#f472b6; font-weight:800; }
-
       .close-tail { color:#a3e635; font-weight:800; }
       .dlbar { display:flex; gap:10px; align-items:center; margin:.6rem 0 .6rem; flex-wrap:wrap; }
-      .parse-line { margin-top:.25rem; margin-bottom:.5rem; }
+      .parse-line { margin:.25rem 0 .5rem; }
       .parse-line button { background:#22c55e !important; color:#fff !important; border:0 !important;
                            padding:.75rem 1.2rem !important; font-weight:800 !important; font-size:16px !important;
                            border-radius:10px !important; width:100%; }
@@ -49,7 +46,7 @@ def _ensure_state():
         "doc_type":None, "law_name":None, "result":None, "chunks":[], "issues":[],
         "strict_lossless":True, "split_long_articles":True,
         "split_threshold_chars":1500, "tail_merge_min_chars":200, "overlap_chars":200,
-        "number_scope":"article만", "bracket_front_matter":True,
+        "bracket_front_matter":True, "bracket_headnotes":True,
         "use_llm_law":True, "use_llm_desc":True,
         "report_json_str":"", "chunks_jsonl_str":"", "llm_errors":[]}
     for k,v in defaults.items(): st.session_state.setdefault(k,v)
@@ -66,16 +63,15 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
 def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-# ───────── 원문 렌더(오버랩 시각화) ───────── #
-def render_with_overlap(text: str, chunks: List[Chunk], *, number_scope="article만", bracket_front_matter=True) -> str:
+# ---------- 원문 렌더 ----------
+def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, include_head=True) -> str:
     N=len(text)
-    if number_scope=="전체 청크":
-        units=[c for c in chunks if c.meta.get("type") in ("front_matter","article","headnote")]
-    else:
-        units=[c for c in chunks if c.meta.get("type")=="article"]
-        if bracket_front_matter:
-            fms=[c for c in chunks if c.meta.get("type")=="front_matter"]
-            units=(fms+units) if fms else units
+    units=[]
+    if include_front:
+        units += [c for c in chunks if c.meta.get("type")=="front_matter"]
+    if include_head:
+        units += [c for c in chunks if c.meta.get("type")=="headnote"]
+    units += [c for c in chunks if c.meta.get("type")=="article"]
     units.sort(key=lambda c:(c.span_start,c.span_end))
 
     parts=[]; cur=0; idx=0
@@ -84,37 +80,29 @@ def render_with_overlap(text: str, chunks: List[Chunk], *, number_scope="article
         if s<0 or e>N or e<=s: continue
         if s>cur: parts.append(_esc(text[cur:s]))
 
-        # 코어스팬(문서 절대좌표) – 없거나 이상하면 전체를 코어로 간주
         cs,ce = c.meta.get("core_span",[s,e])
         if not (isinstance(cs,int) and isinstance(ce,int) and s<=cs<=ce<=e):
             cs,ce=s,e
 
         parts.append(f'<span class="chunk-wrap" title="{_esc(c.meta.get("section_label","chunk"))}">')
-
-        # 앞 오버랩
         if cs>s:
             parts.append('<span class="overlap-mark">{</span>')
             parts.append(f'<span class="overlap">{_esc(text[s:cs])}</span>')
-        # 코어
         parts.append(_esc(text[cs:ce]))
-        # 뒤 오버랩
         if e>ce:
             parts.append(f'<span class="overlap">{_esc(text[ce:e])}</span>')
             parts.append('<span class="overlap-mark">}</span>')
-
-        parts.append("</span>")  # chunk-wrap 닫기
-
+        parts.append("</span>")
         idx+=1
         parts.append(f' <span class="close-tail">}} chunk {idx:04d}</span><br/>')
         cur=e
     if cur<N: parts.append(_esc(text[cur:N]))
     return '<div class="doc">'+"".join(parts)+"</div>"
 
-# ───────── Main ───────── #
+# ---------- Main ----------
 def main():
     _inject_css(); _ensure_state()
     st.title(APP_TITLE)
-    st.caption("연두 중괄호=청크, 연핑크 배경=오버랩(문맥). LLM은 gpt-4.1-mini-2025-04-14 → gemini-2.5-flash → gpt-5 순서.")
 
     up = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
     with st.container():
@@ -129,7 +117,9 @@ def main():
     o1,o2,o3=st.columns(3)
     with o1: st.session_state["strict_lossless"]=st.checkbox("Strict 무손실", value=st.session_state["strict_lossless"])
     with o2: st.session_state["split_long_articles"]=st.checkbox("롱 조문 분할", value=st.session_state["split_long_articles"])
-    with o3: st.session_state["bracket_front_matter"]=st.checkbox("Front matter도 표시", value=st.session_state["bracket_front_matter"])
+    with o3:
+        st.session_state["bracket_front_matter"]=st.checkbox("Front matter도 표시", value=st.session_state["bracket_front_matter"])
+        st.session_state["bracket_headnotes"]=st.checkbox("Headnote(ส่วน/หมวด 등) 표시", value=st.session_state["bracket_headnotes"])
 
     l1,l2=st.columns(2)
     with l1: st.session_state["use_llm_law"]=st.checkbox("LLM: 법령명/유형 보정", value=st.session_state["use_llm_law"])
@@ -179,7 +169,7 @@ def main():
                 fallback1_model="gemini-2.5-flash",
                 fallback2_model="gpt-5",
             )
-            obj, diag = router.lawname_doctype(text[:1200])
+            obj, diag = router.lawname_doctype(text[:1600])
             llm_log["law"]={"diag":diag,"output":obj}
             for e in diag.get("errors", []): llm_errors.append(f'{e.get("provider")}/{e.get("model")}: {e.get("error")}')
             if obj and obj.get("confidence",0)>=0.75:
@@ -197,7 +187,7 @@ def main():
                 if c.meta.get("type")!="article": continue
                 cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
                 core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
-                items.append((core[:1200], c.meta.get("section_label",""), c.breadcrumbs or []))
+                items.append((core[:1600], c.meta.get("section_label",""), c.breadcrumbs or []))
             descs, dlog = router.describe_chunks_batch(items)
             llm_log["desc"]=dlog
             for r in dlog.get("routes",[]):
@@ -211,9 +201,9 @@ def main():
 
         st.session_state["llm_errors"] = llm_errors
 
-        # 4) REPORT (오버랩 샘플 10개 포함)
+        # 4) REPORT
         cov=_coverage(chunks, len(result.full_text))
-        # 오버랩이 실제 있는 청크들 샘플
+        # 오버랩 샘플
         samples=[]
         for c in chunks:
             s,e=int(c.span_start),int(c.span_end)
@@ -235,7 +225,9 @@ def main():
                 "tail_merge_min_chars":st.session_state["tail_merge_min_chars"],
                 "overlap_chars":st.session_state["overlap_chars"],
                 "bracket_front_matter":st.session_state["bracket_front_matter"],
-                "use_llm_law":st.session_state["use_llm_law"], "use_llm_desc":st.session_state["use_llm_desc"],
+                "bracket_headnotes":st.session_state["bracket_headnotes"],
+                "use_llm_law":st.session_state["use_llm_law"],
+                "use_llm_desc":st.session_state["use_llm_desc"],
                 "primary_llm_model":"gpt-4.1-mini-2025-04-14"
             },
             debug={
@@ -253,7 +245,7 @@ def main():
             "issues":issues_after, "report_json_str":report_str, "chunks_jsonl_str":chunks_str
         })
 
-    # ───── 표시 & 다운로드 ─────
+    # ---------- 표시/다운로드 ----------
     if st.session_state["parsed"]:
         cov=_coverage(st.session_state["chunks"], len(st.session_state["result"].full_text))
         arts=[c for c in st.session_state["chunks"] if c.meta.get("type")=="article"]
@@ -265,7 +257,6 @@ def main():
             f"**coverage:** {cov:.6f}"
         )
 
-        # LLM 에러 요약 배지
         if st.session_state["llm_errors"]:
             st.markdown(f'<span class="badge-warn">LLM 실패 {len(st.session_state["llm_errors"])}건</span>', unsafe_allow_html=True)
             with st.expander("LLM 실패 사유 보기"):
@@ -284,8 +275,8 @@ def main():
         html = render_with_overlap(
             text=st.session_state["result"].full_text,
             chunks=st.session_state["chunks"],
-            number_scope=st.session_state["number_scope"],
-            bracket_front_matter=st.session_state["bracket_front_matter"],
+            include_front=st.session_state["bracket_front_matter"],
+            include_head=st.session_state["bracket_headnotes"],
         )
         st.markdown('<div class="docwrap">'+html+'</div>', unsafe_allow_html=True)
     else:
