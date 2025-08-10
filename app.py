@@ -13,7 +13,7 @@ from parser_core.postprocess import (
     repair_tree,  # 트리 수복
 )
 from parser_core.schema import ParseResult, Node, Chunk
-from exporters import writers as wr
+from exporters.writers import to_jsonl, make_debug_report  # ← REPORT.json 생성용
 
 APP_TITLE = "Thai Legal Preprocessor — Full Text + Leaf Brackets (연두 중괄호, 오버랩 분할)"
 
@@ -24,22 +24,36 @@ def _inject_css():
         """
         <style>
           .block-container { max-width: 1400px !important; padding-top: .75rem; }
-          .toolbar { position: sticky; top: 0; z-index: 10; padding: .5rem 0 .75rem;
-                     background: var(--background-color); border-bottom: 1px solid rgba(128,128,128,.25); }
+
+          /* 상단 툴바는 최대한 단순하게 */
+          .toolbar { position: sticky; top: 0; z-index: 10; padding: 0 0 .5rem;
+                     background: var(--background-color); }
+
+          /* 원문 박스 */
           .docwrap { border: 1px solid rgba(107,114,128,.25); border-radius: 10px; padding: 16px; }
           .doc { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
                  font-size: 13.5px; line-height: 1.6; position: relative; }
 
           /* 연두색 중괄호(최하위 노드 전체 구간만 감쌈) */
-          .bracket-block { position: relative; padding: 0 12px; border-radius: 6px; }
+          .bracket-block { position: relative; padding: 0 12px; border-radius: 6px; margin: 0 1px; }
           .bracket-block::before, .bracket-block::after {
             content: "{"; position: absolute; top: -1px; bottom: -1px; width: 10px;
-            color: #a3e635;            /* lime-400 */
-            opacity: .85; font-weight: 800;
+            color: #a3e635;            /* lime-400, 더 밝게 */
+            opacity: .90; font-weight: 800;
           }
           .bracket-block::before { left: 0; }
           .bracket-block::after  { right: 0; transform: scaleX(-1); }
-          .muted { color:#6b7280; }
+
+          /* 파싱 버튼 강조 */
+          div.parse-btn > button[kind="secondary"], div.parse-btn > button[kind="primary"] {
+            background: #22c55e !important; color: white !important; border: 0 !important;
+            padding: .7rem 1.2rem !important; font-weight: 800 !important; font-size: 16px !important;
+            border-radius: 10px !important;
+          }
+
+          /* 다운로드 버튼 가독성 */
+          .dlbar { display:flex; gap:10px; align-items:center; margin: .5rem 0 .75rem; }
+          .muted { color:#6b7280; font-size: 12px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -60,7 +74,7 @@ def _ensure_state():
         "split_long_articles": True,
         "split_threshold_chars": 1500,
         "tail_merge_min_chars": 200,
-        "overlap_chars": 200,         # ← 새 옵션: 파트 사이 오버랩
+        "overlap_chars": 200,         # 파트 사이 오버랩
         # 추출 범위
         "include_front_matter": True,
         "include_headnotes": True,
@@ -68,6 +82,9 @@ def _ensure_state():
         "min_headnote_len": 24,
         "min_gap_len": 24,
         "allowed_headnote_levels": ["ภาค","ลักษณะ","หมวด","ส่วน","บท"],
+        # 내부 저장(다운로드용)
+        "report_json_str": "",
+        "chunks_jsonl_str": "",
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -119,7 +136,7 @@ def render_leaf_brackets(text: str, result: ParseResult) -> str:
             parts.append(_html_escape(text[cur:s]))
         seg = _html_escape(text[s:e])
         label = f"{lf.label or ''}{(' ' + lf.num) if lf.num else ''}".strip()
-        # breadcrumbs 만들기
+        # breadcrumbs
         crumbs = []
         p = result.node_map.get(lf.parent_id)
         while p and p.label and p.label != "root":
@@ -127,6 +144,7 @@ def render_leaf_brackets(text: str, result: ParseResult) -> str:
             p = result.node_map.get(p.parent_id)
         crumbs = " / ".join(reversed(crumbs))
         title = label if not crumbs else f"{label} — {crumbs}"
+        # 중괄호가 연속으로 보일 때 가독성을 위해 작은 마진(margin: 0 1px)을 둔다.
         parts.append(f'<span class="bracket-block" title="{_html_escape(title)}">{seg}</span>')
         cur = e
     if cur < N:
@@ -143,23 +161,31 @@ def main():
     st.title(APP_TITLE)
     st.caption("Upload UTF-8 Thai legal .txt → [파싱] → 원문 전체 표시 + 최하위 노드(조문/ข้อ)만 연두 중괄호로 감싸기")
 
+    # 업로더
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
 
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.session_state["strict_lossless"] = st.checkbox("Strict 무손실(coverage=1.0)", value=st.session_state["strict_lossless"])
-    with colB:
-        st.session_state["split_long_articles"] = st.checkbox("롱 조문 분할(문단 경계)", value=st.session_state["split_long_articles"])
-    with colC:
+    # ▶ 파싱 버튼: 파일명 바로 아래, 크고 눈에 띄게
+    parse_clicked = st.button("파싱", key="parse_btn_top", use_container_width=True)
+    st.markdown('<div class="parse-btn"></div>', unsafe_allow_html=True)  # CSS 타겟용 래퍼
+
+    # 옵션: 한 줄에 3개(분할 임계값, tail 병합, 오버랩)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.session_state["split_threshold_chars"] = st.number_input("분할 임계값(문자)", min_value=600, max_value=6000, value=st.session_state["split_threshold_chars"], step=100)
+    with col2:
+        st.session_state["tail_merge_min_chars"] = st.number_input("tail 병합 최소 길이(문자)", min_value=0, max_value=600, value=st.session_state["tail_merge_min_chars"], step=10)
+    with col3:
         st.session_state["overlap_chars"] = st.number_input("오버랩(문맥) 길이", min_value=0, max_value=800, value=st.session_state["overlap_chars"], step=25)
 
+    # 나머지 옵션(간단)
     oc1, oc2, oc3 = st.columns(3)
     with oc1:
-        st.session_state["split_threshold_chars"] = st.number_input("분할 임계값(문자)", min_value=600, max_value=6000, value=st.session_state["split_threshold_chars"], step=100)
+        st.session_state["strict_lossless"] = st.checkbox("Strict 무손실(coverage=1.0)", value=st.session_state["strict_lossless"])
     with oc2:
-        st.session_state["tail_merge_min_chars"] = st.number_input("tail 병합 최소 길이(문자)", min_value=0, max_value=600, value=st.session_state["tail_merge_min_chars"], step=10)
+        st.session_state["split_long_articles"] = st.checkbox("롱 조문 분할(문단 경계)", value=st.session_state["split_long_articles"])
     with oc3:
-        parse_clicked = st.button("파싱")
+        # reserved
+        pass
 
     # 파일 적재
     if uploaded is not None:
@@ -170,6 +196,7 @@ def main():
             st.error("파일 인코딩을 UTF-8로 저장해주세요.")
             return
 
+    # 파싱 실행
     if parse_clicked:
         if not st.session_state["text"]:
             st.warning("먼저 파일을 업로드하세요.")
@@ -195,9 +222,9 @@ def main():
             mode="article_only",
             source_file=source_file,
             law_name=law_name,
-            include_front_matter=st.session_state["include_front_matter"],
-            include_headnotes=st.session_state["include_headnotes"],
-            include_gap_fallback=st.session_state["include_gap_fallback"],
+            include_front_matter=True,
+            include_headnotes=True,
+            include_gap_fallback=True,
             allowed_headnote_levels=list(st.session_state["allowed_headnote_levels"]),
             min_headnote_len=int(st.session_state["min_headnote_len"]),
             min_gap_len=int(st.session_state["min_gap_len"]),
@@ -205,11 +232,37 @@ def main():
             split_long_articles=bool(st.session_state["split_long_articles"]),
             split_threshold_chars=int(st.session_state["split_threshold_chars"]),
             tail_merge_min_chars=int(st.session_state["tail_merge_min_chars"]),
-            # NEW
             overlap_chars=int(st.session_state["overlap_chars"]),
             soft_cut=True,
         )
 
+        # 커버리지 계산 + 다운로드용 파일 생성
+        cov = _coverage(chunks, len(result.full_text))
+        report_str = make_debug_report(
+            parse_result=result,
+            chunks=chunks,
+            source_file=source_file,
+            law_name=law_name or "",
+            run_config={
+                "strict_lossless": bool(st.session_state["strict_lossless"]),
+                "split_long_articles": bool(st.session_state["split_long_articles"]),
+                "split_threshold_chars": int(st.session_state["split_threshold_chars"]),
+                "tail_merge_min_chars": int(st.session_state["tail_merge_min_chars"]),
+                "overlap_chars": int(st.session_state["overlap_chars"]),
+            },
+            debug={
+                "tree_repair": {
+                    "issues_before": len(issues_before),
+                    "issues_after": len(issues_after),
+                    **rep_diag,
+                },
+                "make_chunks_diag": mk_diag or {},
+                "coverage_calc": {"coverage": cov},
+            },
+        )
+        chunks_str = to_jsonl(chunks)
+
+        # 상태 저장
         st.session_state.update({
             "doc_type": doc_type,
             "law_name": law_name,
@@ -217,38 +270,45 @@ def main():
             "chunks": chunks,
             "issues": issues_after,
             "parsed": True,
-            "debug": {
-                "tree_repair": {
-                    "issues_before": len(issues_before),
-                    "issues_after": len(issues_after),
-                    **rep_diag,
-                },
-                "make_chunks_diag": mk_diag or {},
-            }
+            "report_json_str": report_str,
+            "chunks_jsonl_str": chunks_str,
         })
 
-    # ───────── 결과 표시 + 다운로드 ───────── #
+    # ───────── 결과 표시 ───────── #
     if st.session_state["parsed"]:
         cov = _coverage(st.session_state["chunks"], len(st.session_state["result"].full_text))
         arts = [c for c in st.session_state["chunks"] if c.meta.get("type") == "article"]
 
+        # 간단 정보
         with st.container():
             st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
-            c1,c2,_ = st.columns([5,1.2,3])
-            with c1:
-                st.write(
-                    f"**파일:** {st.session_state['source_file']}  |  "
-                    f"**doc_type:** {st.session_state['doc_type']}  |  "
-                    f"**law_name:** {st.session_state['law_name'] or 'N/A'}  |  "
-                    f"**chunks:** {len(st.session_state['chunks'])} (article {len(arts)})  |  "
-                    f"**coverage:** {cov:.6f}"
-                )
-            with c2:
-                jsonl_bytes = wr.to_jsonl(st.session_state["chunks"]).encode("utf-8")
-                st.download_button("JSONL 다운로드", data=jsonl_bytes,
-                                   file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks.jsonl",
-                                   mime="application/json", key="dl-jsonl-top")
+            st.write(
+                f"**파일:** {st.session_state['source_file']}  |  "
+                f"**doc_type:** {st.session_state['doc_type']}  |  "
+                f"**law_name:** {st.session_state['law_name'] or 'N/A'}  |  "
+                f"**chunks:** {len(st.session_state['chunks'])} (article {len(arts)})  |  "
+                f"**coverage:** {cov:.6f}"
+            )
             st.markdown("</div>", unsafe_allow_html=True)
+
+        # ➜ 다운로드 바 (요청대로: 원문 바로 '위'쪽에 배치)
+        st.markdown('<div class="dlbar">', unsafe_allow_html=True)
+        st.download_button(
+            "JSONL 다운로드 (CHUNKS.jsonl)",
+            data=st.session_state["chunks_jsonl_str"].encode("utf-8"),
+            file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks.jsonl",
+            mime="application/json",
+            key="dl-jsonl-bottom",
+        )
+        st.download_button(
+            "DEBUG 다운로드 (REPORT.json)",
+            data=st.session_state["report_json_str"].encode("utf-8"),
+            file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_REPORT.json",
+            mime="application/json",
+            key="dl-report-bottom",
+        )
+        st.markdown('<span class="muted">※ ZIP 번들은 생략하고, JSONL/REPORT를 바로 다운로드할 수 있게 했어요.</span>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # 원문 전체 + 리프 노드만 중괄호 감싸기(표시)
         html = render_leaf_brackets(
