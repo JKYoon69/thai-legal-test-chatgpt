@@ -1,35 +1,37 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-from pydantic import BaseModel
-from typing import Optional, List, Dict
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict
+import uuid
 
-class Span(BaseModel):
-    start: int
-    end: int
+def _nid() -> str:
+    return uuid.uuid4().hex[:12]
 
-class Node(BaseModel):
-    node_id: str
-    level: str            # 문서/ภาค/หมวด/มาตรา/ข้อ/appendix 등
-    label: str            # "มาตรา 12" 같은 원문 라벨(숫자는 아라비아 표준화)
-    num: Optional[str] = None
-    span: Span
-    # NOTE: 용량 줄이기 위해 text는 저장하지 않음 (chunk 생성 시 slice)
-    breadcrumbs: List[str] = []
-    children: List["Node"] = []
+@dataclass
+class Node:
+    level: int               # 0=root, 1..N
+    label: Optional[str]     # e.g., ภาค / ลักษณะ / หมวด / มาตรา / ข้อ / front_matter
+    num: Optional[str]       # e.g., 1, 1/1, ๑, etc. (already normalized upstream)
+    span_start: int
+    span_end: int
+    text: str                # raw text slice for this node
+    children: List["Node"] = field(default_factory=list)
+    parent_id: Optional[str] = None
+    node_id: str = field(default_factory=_nid)
 
-class ParseResult(BaseModel):
+@dataclass
+class ParseResult:
+    root: Node
+    all_nodes: List[Node]
+    node_map: Dict[str, Node]
     doc_type: str
-    nodes: List[Node]
-    root_nodes: List[Node]
-    stats: Dict[str, int] = {}
+    full_text: str
 
-class Issue(BaseModel):
-    level: str   # info/warn/error
-    message: str
-
-class Chunk(BaseModel):
-    chunk_id: str
-    node_ids: List[str]
+@dataclass
+class Chunk:
     text: str
+    span_start: int
+    span_end: int
+    node_ids: List[str]
     breadcrumbs: List[str]
-    span: Span
-    meta: Dict[str, str] = {}
+    meta: Dict[str, str]

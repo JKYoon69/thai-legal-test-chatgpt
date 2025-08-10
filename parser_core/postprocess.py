@@ -1,84 +1,114 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import List, Dict, Tuple
-from .schema import ParseResult, Issue, Chunk, Span, Node
+from typing import List, Dict, Optional
+import re
 
-def _check_duplicates_scoped_by_parent(parent: Node, issues: List[Issue]):
+from .schema import ParseResult, Node, Chunk
+from .rules_th import normalize_text
+
+def validate_tree(result: ParseResult) -> List[str]:
     """
-    Duplicate number check per parent scope.
-    E.g., 'มาตรา 1..' under the Act and 'มาตรา 1..' under the Code are NOT duplicates.
+    Very lightweight checks: level regressions, ultra-short leaves, etc.
     """
-    # group siblings by level
-    by_level: Dict[str, Dict[str, int]] = {}
-    for ch in parent.children:
-        if ch.num:
-            by_level.setdefault(ch.level, {})
-            key = ch.num
-            by_level[ch.level][key] = by_level[ch.level].get(key, 0) + 1
-
-    for level, counter in by_level.items():
-        for num, cnt in counter.items():
-            if cnt > 1:
-                issues.append(Issue(level="warn", message=f"Duplicate {level} number within same parent: {num} (x{cnt})"))
-
-    # recurse
-    for ch in parent.children:
-        _check_duplicates_scoped_by_parent(ch, issues)
-
-def validate_tree(result: ParseResult) -> List[Issue]:
-    issues: List[Issue] = []
-    # basic span sanity
-    for n in result.nodes:
-        if n.span.start >= n.span.end:
-            issues.append(Issue(level="error", message=f"{n.node_id}: empty span"))
-
-    # scoped duplicate check (parent-wise)
-    for root in result.root_nodes:
-        _check_duplicates_scoped_by_parent(root, issues)
-
+    issues: List[str] = []
+    prev_level = 0
+    for n in result.all_nodes:
+        if n is result.root:
+            continue
+        if n.level < 0:
+            issues.append(f"Invalid level at {n.label} {n.num}")
+        if len(n.text.strip()) < 2 and n.label not in ("front_matter",):
+            issues.append(f"Too short node: {n.label} {n.num}")
+        prev_level = n.level
     return issues
 
-def make_chunks(raw_text: str, result: ParseResult, mode: str = "article±1") -> List[Chunk]:
+def _is_leaf(n: Node) -> bool:
+    # consider มาตรา / ข้อ as leaves (and anything without children at deepest level)
+    if n.children:
+        return False
+    return n.label in ("มาตรา", "ข้อ")
+
+def _breadcrumbs(n: Node, result: ParseResult) -> List[str]:
+    crumbs = []
+    cur = n
+    while cur and cur.parent_id:
+        crumbs.append(f"{cur.label or ''}{(' ' + cur.num) if cur.num else ''}".strip())
+        cur = result.node_map.get(cur.parent_id)
+        if cur and cur.label == "root":
+            break
+    return list(reversed(crumbs))
+
+def guess_law_name(text: str) -> Optional[str]:
     """
-    article_only: 'มาตรา/ข้อ' unit
-    article±1  : shallow-merge with neighbors
-    fallback   : leaf-based chunking if no article found
+    Heuristic: first line that contains พระราชบัญญัติ or ประมวลกฎหมาย
     """
-    leaves = [n for n in result.nodes if not n.children]
+    norm = normalize_text(text)
+    for line in norm.splitlines()[:40]:
+        if "พระราชบัญญัติ" in line or "ประมวลกฎหมาย" in line:
+            return line.strip()
+    return None
+
+def _gather_leaves(root: Node) -> List[Node]:
+    leaves: List[Node] = []
+    stack = list(root.children)
+    while stack:
+        n = stack.pop(0)
+        if _is_leaf(n):
+            leaves.append(n)
+        for c in n.children:
+            stack.append(c)
+    return leaves
+
+def make_chunks(
+    result: ParseResult,
+    mode: str = "article±1",
+    source_file: Optional[str] = None,
+    law_name: Optional[str] = None,
+) -> List[Chunk]:
+    """
+    Produce chunk objects ready for embedding/FTS ingestion.
+    Modes:
+      - article_only: each มาตรา/ข้อ as a chunk
+      - article±1   : shallow merge with prev/next leaf
+    """
+    leaves = _gather_leaves(result.root)
     chunks: List[Chunk] = []
 
-    def is_article(node) -> bool:
-        return node.level in ("มาตรา", "ข้อ")
+    for i, leaf in enumerate(leaves):
+        merge_ids = [i]
+        if mode == "article±1":
+            if i > 0:
+                merge_ids.insert(0, i - 1)
+            if i + 1 < len(leaves):
+                merge_ids.append(i + 1)
 
-    art_idxs = [i for i, n in enumerate(leaves) if is_article(n)]
-    for idx in art_idxs:
-        chosen = [leaves[idx]] if mode == "article_only" else \
-                 [x for x in leaves[max(0, idx - 1): idx + 2] if is_article(x)]
+        # merge spans
+        span_start = min(leaves[j].span_start for j in merge_ids)
+        span_end = max(leaves[j].span_end for j in merge_ids)
+        text = result.full_text[span_start:span_end]
 
-        start = min(c.span.start for c in chosen)
-        end = max(c.span.end for c in chosen)
-        text = raw_text[start:end]
+        node_ids = [leaves[j].node_id for j in merge_ids]
+        crumbs = _breadcrumbs(leaf, result)
+
+        section_label = f"{leaf.label} {leaf.num}".strip()
+
+        meta = {
+            "mode": mode,
+            "doc_type": result.doc_type,
+            "law_name": law_name or "",
+            "section_label": section_label,
+            "source_file": source_file or "",
+        }
 
         chunks.append(
             Chunk(
-                chunk_id=f"chunk-{leaves[idx].node_id}",
-                node_ids=[c.node_id for c in chosen],
-                text=text.strip(),
-                breadcrumbs=leaves[idx].breadcrumbs,
-                span=Span(start=start, end=end),
-                meta={"mode": mode, "doc_type": result.doc_type},
+                text=text,
+                span_start=span_start,
+                span_end=span_end,
+                node_ids=node_ids,
+                breadcrumbs=crumbs,
+                meta=meta,
             )
         )
 
-    if not chunks and leaves:
-        for leaf in leaves:
-            chunks.append(
-                Chunk(
-                    chunk_id=f"chunk-{leaf.node_id}",
-                    node_ids=[leaf.node_id],
-                    text=raw_text[leaf.span.start:leaf.span.end],
-                    breadcrumbs=leaf.breadcrumbs,
-                    span=leaf.span,
-                    meta={"mode": "leaf", "doc_type": result.doc_type},
-                )
-            )
     return chunks

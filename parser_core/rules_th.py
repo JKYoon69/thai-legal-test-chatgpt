@@ -1,40 +1,79 @@
-import regex as re
+# -*- coding: utf-8 -*-
+"""
+Thai legal parsing rules (regex + normalizers)
+"""
+import re
 
-THAI_DIGITS = "๐๑๒๓๔๕๖๗๘๙"
-ARABIC_DIGITS = "0123456789"
-THAI2ARABIC = str.maketrans({t: a for t, a in zip(THAI_DIGITS, ARABIC_DIGITS)})
+# Thai-digit → ASCII-digit map
+THAI_DIGITS = str.maketrans({
+    "๐": "0", "๑": "1", "๒": "2", "๓": "3", "๔": "4",
+    "๕": "5", "๖": "6", "๗": "7", "๘": "8", "๙": "9",
+})
 
-def normalize_text(s: str) -> str:
-    # 기본 정규화: 태국숫자→아라비아, 개행 통일, 과도한 공백 정리
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = s.translate(THAI2ARABIC)
-    # 불필요한 탭/연속 공백 정리 (태국어에는 단어 간 공백이 적으므로 과도하게 줄이지 않음)
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+NBSP = "\u00A0"
+BOM = "\ufeff"
 
-# 문서 유형별 계층 레벨 정의 (상위→하위)
-LEVELS = {
-    "code":        ["ภาค", "ลักษณะ", "หมวด", "ส่วน", "บท", "มาตรา"],
-    "act":         ["หมวด", "ส่วน", "บท", "มาตรา"],
-    "royal_decree":["หมวด", "ส่วน", "บท", "มาตรา"],
-    "regulation":  ["หมวด", "ส่วน", "บท", "ข้อ"],
-    "unknown":     ["หมวด", "ส่วน", "บท", "มาตรา", "ข้อ"],
-}
+def remove_bom(text: str) -> str:
+    return text.replace(BOM, "")
 
-# ---- 핵심: 라인 시작 anchor + 'ที่' 허용 ----
-# 예: "ภาคที่ 1", "ลักษณะที่ 2", "หมวด 3", "มาตรา 12", "ข้อ 5"
+def normalize_spaces(text: str) -> str:
+    # collapse weird spaces, ensure Windows/Mac newlines are normalized
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace(NBSP, " ")
+    # trim excessive empty lines (keep at most 2)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+def normalize_thai_digits(text: str) -> str:
+    return text.translate(THAI_DIGITS)
+
+def normalize_text(text: str) -> str:
+    text = remove_bom(text)
+    text = normalize_spaces(text)
+    text = normalize_thai_digits(text)
+    return text
+
+# -------- Regex headers --------
+# number fragment
 RE_NUM = r"(?P<num>\d{1,4}(?:/\d{1,3})?)"
-# 상위 레벨들: 'ที่'가 있을 수도/없을 수도
+
+# allow optional dot and odd spaces after number
+TAIL_NUM = r"(?:\s*\.?)"
+
 RE_HEADER = {
-    "ภาค":      re.compile(rf"(?m)^(?P<label>ภาค)(?:ที่)?\s*{RE_NUM}\b"),
-    "ลักษณะ":   re.compile(rf"(?m)^(?P<label>ลักษณะ)(?:ที่)?\s*{RE_NUM}\b"),
-    "หมวด":     re.compile(rf"(?m)^(?P<label>หมวด)(?:ที่)?\s*{RE_NUM}\b"),
-    "ส่วน":     re.compile(rf"(?m)^(?P<label>ส่วน)(?:ที่)?\s*{RE_NUM}\b"),
-    "บท":       re.compile(rf"(?m)^(?P<label>บท)(?:ที่)?\s*{RE_NUM}\b"),
-    "มาตรา":    re.compile(rf"(?m)^(?P<label>มาตรา)\s+{RE_NUM}\b"),
-    "ข้อ":       re.compile(rf"(?m)^(?P<label>ข้อ)\s+{RE_NUM}\b"),
+    # major structural units (anchored at line start)
+    "ภาค": re.compile(rf"(?m)^(?P<label>ภาค)\s+{RE_NUM}{TAIL_NUM}\b"),
+    "ลักษณะ": re.compile(rf"(?m)^(?P<label>ลักษณะ)\s+{RE_NUM}{TAIL_NUM}\b"),
+    "หมวด": re.compile(rf"(?m)^(?P<label>หมวด)\s+{RE_NUM}{TAIL_NUM}\b"),
+    "ส่วน": re.compile(rf"(?m)^(?P<label>ส่วน)\s+{RE_NUM}{TAIL_NUM}\b"),
+    "บท": re.compile(rf"(?m)^(?P<label>บท)\s+{RE_NUM}{TAIL_NUM}\b"),
+
+    # frequently appearing named sections (no number)
+    "บทเฉพาะกาล": re.compile(rf"(?m)^(?P<label>บทเฉพาะกาล)\b"),
+    "บทบัญญัติทั่วไป": re.compile(rf"(?m)^(?P<label>บทบัญญัติทั่วไป)\b"),
+
+    # article / section
+    # Note: tolerate extra spaces or NBSP between label and number; optional dot.
+    "มาตรา": re.compile(rf"(?m)^(?P<label>มาตรา)[ \t{NBSP}]+{RE_NUM}{TAIL_NUM}\b"),
+    "ข้อ": re.compile(rf"(?m)^(?P<label>ข้อ)[ \t{NBSP}]+{RE_NUM}{TAIL_NUM}\b"),
 }
 
-# 부록/말미 표시는 줄 시작에 주로 등장
-RE_APPENDIX = re.compile(r"(?m)^(บัญชีท้าย|ภาคผนวก|แผนที่ท้าย)[^\n]*")
+# order of levels (lower index = higher in hierarchy)
+LEVEL_ORDER = [
+    "front_matter",  # virtual
+    "ภาค",
+    "ลักษณะ",
+    "หมวด",
+    "ส่วน",
+    "บท",  # also hosts บทเฉพาะกาล / บทบัญญัติทั่วไป (same level)
+    "มาตรา",
+    "ข้อ",
+]
+
+def label_level(label: str) -> int:
+    if label in ("บทเฉพาะกาล", "บทบัญญัติทั่วไป"):
+        label = "บท"
+    try:
+        return LEVEL_ORDER.index(label)
+    except ValueError:
+        return LEVEL_ORDER.index("front_matter")
