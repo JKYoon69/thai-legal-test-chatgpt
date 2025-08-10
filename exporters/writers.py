@@ -150,19 +150,29 @@ def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
     sizes = _percentiles(lens)
     hist = _histogram(lens)
     by_series: Counter = Counter(c.meta.get("series","1") for c in arts)
+    by_series_total: Counter = Counter(c.meta.get("series_total","1") for c in arts)
     arts_sorted = sorted(arts, key=lambda c: len(c.text))
     def bc(c: Chunk) -> str:
         return " / ".join(c.breadcrumbs or [])
     shortest = [{"section_label": c.meta.get("section_label",""),
                  "breadcrumbs": bc(c),
                  "section_uid": c.meta.get("section_uid",""),
+                 "series_index": c.meta.get("series_index","1"),
+                 "series_total": c.meta.get("series_total","1"),
                  "len": len(c.text)} for c in arts_sorted[:5]]
     longest  = [{"section_label": c.meta.get("section_label",""),
                  "breadcrumbs": bc(c),
                  "section_uid": c.meta.get("section_uid",""),
+                 "series_index": c.meta.get("series_index","1"),
+                 "series_total": c.meta.get("series_total","1"),
                  "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
-    return {"count": len(arts), "length_stats_chars": sizes, "length_histogram": hist,
-            "series_counts": dict(by_series), "top_shortest": shortest, "top_longest": longest}
+    return {"count": len(arts),
+            "length_stats_chars": sizes,
+            "length_histogram": hist,
+            "series_counts": dict(by_series),
+            "series_total_counts": dict(by_series_total),
+            "top_shortest": shortest,
+            "top_longest": longest}
 
 # ───────────────────────────── REPORT ───────────────────────────── #
 
@@ -196,8 +206,10 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
     removed_total = sum(removals.values()) if isinstance(removals, dict) else 0
     accounting_ok = (final_headnote_count <= headnote_after_filter)
 
-    # 트리 수복 진단
+    # 트리 수복 진단 + 분할/테일 병합 진단
     tree_repair = (debug or {}).get("tree_repair", {}) if debug else {}
+    split_diag = mk_diag.get("split", {})
+    tail_merge = mk_diag.get("tail_merge", {})
 
     report = {
         "source_file": source_file,
@@ -205,7 +217,7 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
         "doc_type": parse_result.doc_type,
         "run_config": run_config or {},
         "tree": _tree_stats(parse_result),
-        "tree_repair": tree_repair,  # ⬅️ before/after/조정량 등
+        "tree_repair": tree_repair,
         "chunks": {
             "count": len(chunks),
             "type_counts": dict(type_counts),
@@ -234,6 +246,8 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
             "removed_total_estimate": removed_total,
             "consistency_check_ok": accounting_ok,
         },
+        "split": split_diag,
+        "tail_merge": tail_merge,
         "strict_post_fill": strict_post_fill,
         "sample_chunk_head": (chunks[0].text[:400] if chunks else ""),
         "debug": debug or {},

@@ -16,8 +16,7 @@ _LEVEL_ORDER = {
     "ลักษณะ": 3,
     "หมวด": 4,
     "ส่วน": 5,
-    # 'บทบัญญัติทั่วไป', 'บทกำหนดโทษ', 'บทเฉพาะกาล' 등은 'บท*' prefix로 취급
-    "บท*": 6,
+    "บท*": 6,  # 'บทบัญญัติทั่วไป', 'บทกำหนดโทษ' 등 prefix 취급
     "มาตรา": 7,
     "ข้อ": 7,
 }
@@ -91,11 +90,12 @@ def _thai_to_arabic(s: str) -> str:
 
 def guess_law_name(text: str) -> Optional[str]:
     """
-    제목 + 부제 + 연도(พ.ศ.)를 최대한 한 줄로 결합
+    제목 + 부제 + 연도(พ.ศ.) 결합
     - 태국 숫자 → 아라비아 숫자 변환
+    - 첫 표제행 + 다음 1~5행에서 부제/연도 탐색
     """
     norm = normalize_text(text)
-    lines = [ln.strip(" \t-–—") for ln in norm.splitlines()[:80] if ln.strip()]
+    lines = [ln.strip(" \t-–—") for ln in norm.splitlines()[:120] if ln.strip()]
     base_idx = None
     for i, ln in enumerate(lines):
         if ("พระราชบัญญัติ" in ln) or ("ประมวลกฎหมาย" in ln):
@@ -105,30 +105,29 @@ def guess_law_name(text: str) -> Optional[str]:
         return None
 
     title = lines[base_idx]
-    # 다음 몇 줄에서 부제/연도 후보 찾기
-    tail = ""
+    subline = ""
+    yearline = ""
     for j in range(base_idx + 1, min(base_idx + 6, len(lines))):
         ln = lines[j]
         if any(k in ln for k in ("ภาค", "ลักษณะ", "หมวด", "ส่วน", "บท", "มาตรา")):
             break
-        # 연도 포함 라인 우선
-        if "พ.ศ." in ln or "พ. ศ." in ln or "พศ" in ln:
-            tail = ln
-            break
-        # 부제만 있는 경우(예: "ให้ใช้ประมวลกฎหมายยาเสพติด")
-        if not tail:
-            tail = ln
+        if ("พ.ศ." in ln) or ("พ. ศ." in ln) or ("พศ" in ln):
+            yearline = ln
+        # 흔한 부제: "ให้ใช้ประมวลกฎหมายยาเสพติด" 등
+        if ("ให้ใช้" in ln) or ("ยาเสพติด" in ln) or ("ประมวลกฎหมาย" in ln):
+            subline = ln if len(ln) > len(subline) else subline
+        # 연도 미탐지시 부제만 있어도 채택
+        if not subline:
+            subline = ln
 
-    cand = title
-    if tail:
-        # 중복 슬래시 제거하고 공백으로 결합
-        cand = f"{title} {tail}"
-
-    # 숫자 정규화
+    parts = [title]
+    if subline and subline not in title:
+        parts.append(subline)
+    if yearline and yearline not in title and yearline != subline:
+        parts.append(yearline)
+    cand = " ".join(parts)
     cand = _thai_to_arabic(cand)
-    # 'พ.ศ.' 뒤 연도가 붙지 않은 경우 라인 전체에서 연도 재탐색
-    # (간단 정규화: 'พ.ศ. ' 패턴에 아라비아 숫자 기대)
-    return cand.strip()
+    return " ".join(cand.split()).strip()
 
 # ───────────────────────────── 검증 ───────────────────────────── #
 
@@ -159,9 +158,9 @@ def validate_tree(result: ParseResult) -> List[str]:
 def repair_tree(result: ParseResult) -> Dict[str, Any]:
     """
     부모-자식 경계 불일치 최소화:
-      1) bottom-up으로 부모 span을 자식 union에 맞게 확장/축소
-      2) (보수적) reparent는 최소화: 부모 랭크가 자식보다 낮거나 같아도, 우선은 span 보정으로 해결
-    무손실: 텍스트/스팬의 총합(coverage)에는 영향 없음.
+      1) bottom-up으로 부모 span을 자식 union에 맞게 확장(축소는 보수적)
+      2) 여전히 벗어나는 자식은 root로 최소 reparent
+    무손실: coverage에는 영향 없음.
     """
     full = result.full_text
     diag: Dict[str, Any] = {
@@ -170,7 +169,6 @@ def repair_tree(result: ParseResult) -> Dict[str, Any]:
         "shrunk_total_chars": 0,
     }
 
-    # depth별 정렬(깊은 노드부터 부모로)
     nodes_by_depth: Dict[int, List[Node]] = {}
     max_depth = 0
     for n in result.all_nodes:
@@ -182,17 +180,14 @@ def repair_tree(result: ParseResult) -> Dict[str, Any]:
     for depth in range(max_depth - 1, -1, -1):
         for p in nodes_by_depth.get(depth, []):
             if not p.children:
-                # 말단: text 동기화만 보장
                 if p.span_start is not None and p.span_end is not None:
                     p.text = full[p.span_start:p.span_end]
                 continue
-            # 자식 union 계산
             child_spans = [(c.span_start, c.span_end) for c in p.children if c.span_start is not None and c.span_end is not None]
             if not child_spans:
                 continue
             new_start = min(s for s, _ in child_spans)
             new_end = max(e for _, e in child_spans)
-            # 부모가 자식 union을 포함하지 못하면 보정
             if p.span_start is None or p.span_end is None:
                 p.span_start, p.span_end = new_start, new_end
                 p.text = full[p.span_start:p.span_end]
@@ -209,46 +204,25 @@ def repair_tree(result: ParseResult) -> Dict[str, Any]:
                 diag["expanded_total_chars"] += (new_end - old_e)
                 old_e = new_end
                 changed = True
-            # 부모가 자식보다 과도하게 넓은 경우(상황에 따라 축소) — 보수적으로, 자식 union보다 좌우 0~N만큼 여유가 있어도 유지 가능
-            # 여기서는 안전하게 union으로 딱 맞추지 않고, 기존 부모 경계를 유지(축소는 최소화).
-            # 다만 명백히 자식 union 밖의 공백만 포함할 때는 축소.
-            if old_s > new_start or old_e < new_end:
-                # 이미 위에서 확장했으니 축소 불가 상태
-                pass
-            else:
-                # 부모가 자식을 충분히 포함하는데 과도하게 넓을 경우, 가장자리의 연속 공백만 있을 때만 축소
-                left_pad = full[new_start: p.span_start]
-                right_pad = full[p.span_end: new_end]
-                # 위 계산은 old_s/old_e로 바뀌었을 수 있으므로 간단히 새로 정의
-                left_pad = full[new_start: old_s]
-                right_pad = full[old_e: new_end]
-                # pad가 모두 공백/개행이라면 축소
-                # (실제론 위에서 old_s/e를 new_*에 맞췄으므로 left_pad/right_pad는 거의 빈 문자열일 것)
-                # 보수적 접근: 축소는 하지 않음(안전)
-                pass
 
             if changed:
                 p.span_start, p.span_end = old_s, old_e
                 p.text = full[p.span_start:p.span_end]
                 diag["adjusted_parents"] += 1
 
-    # 2) 부모 밖으로 벗어난 자식이 남았는지 최종 점검(필요 시 최소 reparent)
-    # 대부분은 부모 span 보정으로 해결됨. 예외적으로 여전히 벗어난 경우 root로 올려 임시 수복.
+    # 2) 여전히 부모 밖에 있는 자식은 최소 reparent(root)
     root = result.root
     for p in result.all_nodes:
         for c in list(p.children):
             if c.span_start < p.span_start or c.span_end > p.span_end:
-                # 최소 reparent: root로 이동 (보수적; 파괴 최소)
                 try:
                     p.children.remove(c)
                 except ValueError:
                     pass
                 c.parent_id = root.node_id
                 root.children.append(c)
-                # root는 항상 전체를 커버하므로 불일치 해소
                 diag["adjusted_parents"] += 1
 
-    # node_map 재구성(안전)
     result.node_map = {n.node_id: n for n in result.all_nodes}
     return diag
 
@@ -312,16 +286,17 @@ def make_chunks(
     min_headnote_len: int = 24,
     min_gap_len: int = 24,
     strict_lossless: bool = False,
-    # ⬇️ A단계: 롱 조문 보조분할 옵션(기본 OFF)
+    # 롱 조문 보조분할 + tail 병합
     split_long_articles: bool = False,
     split_threshold_chars: int = 1800,
+    tail_merge_min_chars: int = 200,
 ) -> Tuple[List[Chunk], Dict[str, Any]]:
     """
     Strict 모드:
       - headnote/gap 길이 필터 비활성
       - 모든 정리 후 post-fill로 남은 간극을 orphan_gap으로 보강(공백-only 포함)
     + 회계(diag): 제거 사유 세분화
-    + 롱 조문 보조분할(옵션)
+    + 롱 조문 보조분할(옵션) + tail 병합(최소 길이 미만은 앞 part와 병합)
     """
     text = result.full_text
     total_len = len(text)
@@ -339,6 +314,16 @@ def make_chunks(
         },
         "strict_post_fill": {"enabled": bool(strict_lossless), "filled_gaps": 0, "total_chars": 0, "spans": []},
         "allowed_headnote_levels_effective": list(allowed_headnote_levels) + ["บท* (prefix)"],
+        "split": {
+            "enabled": bool(split_long_articles),
+            "threshold": int(split_threshold_chars),
+            "series_total_counts": {},   # 예: {"1": 30, "2": 120, "3": 55}
+        },
+        "tail_merge": {
+            "min_chars": int(tail_merge_min_chars),
+            "merged_count": 0,
+            "affected_sections": [],     # section_uid 일부 샘플
+        },
     }
 
     # 1) article leaves
@@ -360,6 +345,20 @@ def make_chunks(
             p = cut
         return spans
 
+    def _apply_tail_merge(spans: List[Tuple[int, int]], section_uid: str) -> List[Tuple[int, int]]:
+        if len(spans) <= 1:
+            return spans
+        last_s, last_e = spans[-1]
+        if (last_e - last_s) < tail_merge_min_chars:
+            # 이전 파트와 병합
+            prev_s, prev_e = spans[-2]
+            merged = spans[:-2] + [(prev_s, last_e)]
+            diag["tail_merge"]["merged_count"] += 1
+            if len(diag["tail_merge"]["affected_sections"]) < 10:
+                diag["tail_merge"]["affected_sections"].append(section_uid)
+            return merged
+        return spans
+
     article_index = 0
     for leaf in leaves:
         article_index += 1
@@ -368,8 +367,12 @@ def make_chunks(
         section_uid = "/".join(crumbs) if crumbs else section_label
 
         spans = _split_paragraph_smart(leaf.span_start, leaf.span_end)
+        spans = _apply_tail_merge(spans, section_uid)
+        series_total = len(spans)
+        diag["split"]["series_total_counts"][str(series_total)] = diag["split"]["series_total_counts"].get(str(series_total), 0) + 1
+
         for k, (s, e) in enumerate(spans, 1):
-            label = section_label + (f" (part {k})" if len(spans) > 1 else "")
+            label = section_label + (f" (part {k})" if series_total > 1 else "")
             meta = {
                 "type": "article",
                 "mode": mode,
@@ -381,7 +384,8 @@ def make_chunks(
                 "article_index_global": str(article_index),
                 "series": str(series_map.get(leaf.node_id, 1)),
                 "retrieval_weight": str(_retrieval_weight_for("article")),
-                "part": str(k) if len(spans) > 1 else "1",
+                "series_index": str(k),
+                "series_total": str(series_total),
             }
             chunks.append(
                 Chunk(
@@ -410,6 +414,8 @@ def make_chunks(
                         "section_uid": "front_matter",
                         "source_file": source_file or "",
                         "retrieval_weight": str(_retrieval_weight_for("front_matter")),
+                        "series_index": "1",
+                        "series_total": "1",
                     }
                     chunks.append(
                         Chunk(
@@ -430,7 +436,7 @@ def make_chunks(
         def is_allowed_label(lbl: Optional[str]) -> bool:
             if not lbl:
                 return False
-            return (lbl in allowed) or lbl.startswith("บท")  # 이명 허용
+            return (lbl in allowed) or lbl.startswith("บท")
 
         def walk(parent: Node):
             nonlocal diag
@@ -455,6 +461,8 @@ def make_chunks(
                             "section_uid": section_uid,
                             "source_file": source_file or "",
                             "retrieval_weight": str(_retrieval_weight_for("headnote")),
+                            "series_index": "1",
+                            "series_total": "1",
                         }
                         chunks.append(
                             Chunk(
@@ -502,6 +510,8 @@ def make_chunks(
                     "section_uid": f"gap[{s}:{e}]",
                     "source_file": source_file or "",
                     "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
+                    "series_index": "1",
+                    "series_total": "1",
                 }
                 chunks.append(
                     Chunk(
@@ -514,9 +524,9 @@ def make_chunks(
                     )
                 )
             else:
-                diag["removals"]["removed_short"] += 1  # gap이 너무 짧아 버림(Strict OFF)
+                diag["removals"]["removed_short"] += 1
 
-    # ── 정리: 정렬 → 동기화 → 동일구간 dedupe → 연속 겹침 클립 ── #
+    # ── 정리: 정렬 → 동기화 → 동일 스팬 dedupe → 연속 겹침 클립 ── #
     chunks.sort(key=lambda c: (c.span_start, c.span_end))
 
     cleaned: List[Chunk] = []
@@ -571,7 +581,7 @@ def make_chunks(
     # headnote 최종 개수 기록
     diag["final_headnote_count"] = sum(1 for c in final if c.meta.get("type") == "headnote")
 
-    # ── Strict 전용 post-fill: 마지막까지 남은 간극 모두 메움 ── #
+    # ── Strict 전용 post-fill ── #
     if strict_lossless:
         ivs2 = _compute_union([(c.span_start, c.span_end) for c in final])
         post_gaps: List[Tuple[int, int]] = []
@@ -599,6 +609,8 @@ def make_chunks(
                 "source_file": source_file or "",
                 "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
                 "strict_fill": "1",
+                "series_index": "1",
+                "series_total": "1",
             }
             final.append(
                 Chunk(
