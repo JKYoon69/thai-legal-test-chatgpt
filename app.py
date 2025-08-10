@@ -2,11 +2,11 @@
 import io
 import json
 import time
-from typing import List
+from typing import List, Tuple, Dict, Any
 
 import streamlit as st
 
-# 패키지 레이아웃을 우선 사용
+# 패키지 레이아웃(권장)
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import validate_tree, make_chunks, guess_law_name
 from parser_core.schema import ParseResult, Node, Chunk
@@ -46,8 +46,8 @@ def _ensure_state():
         "allowed_headnote_levels": ["ภาค","ลักษณะ","หมวด","ส่วน","บท"],
         "min_headnote_len": 24,
         "min_gap_len": 24,
-        # Strict 무손실(coverage=1.0 보장)
-        "strict_lossless": False,
+        # Strict 무손실(coverage=1.0 보장 의도)
+        "strict_lossless": True,
         "show_raw": False,
     }.items():
         st.session_state.setdefault(k, v)
@@ -127,9 +127,9 @@ def main():
         issues = validate_tree(result)
         t4 = time.time()
 
-        # 4) chunks
+        # 4) chunks (+ diag)
         law_name = guess_law_name(text)
-        chunks: List[Chunk] = make_chunks(
+        chunks, mk_diag = make_chunks(
             result=result,
             mode=st.session_state["mode"],
             source_file=source_file,
@@ -171,7 +171,8 @@ def main():
                 "validate": round(t4 - t3, 6),
                 "make_chunks": round(t5 - t4, 6),
                 "total": round(t5 - t0, 6),
-            }
+            },
+            "make_chunks_diag": mk_diag or {},
         }
 
     # toolbar / export

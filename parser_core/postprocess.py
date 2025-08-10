@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Any
 
 from .schema import ParseResult, Node, Chunk
 from .rules_th import normalize_text
@@ -156,14 +156,23 @@ def make_chunks(
     min_headnote_len: int = 24,
     min_gap_len: int = 24,
     strict_lossless: bool = False,
-) -> List[Chunk]:
+) -> Tuple[List[Chunk], Dict[str, Any]]:
     """
-    조문 1:1 + front_matter/headnote/gap 보강(옵션) + Strict 무손실(선택)
-    - strict_lossless=True인 경우: gap-sweeper가 길이 무관으로 모든 간극을 orphan_gap으로 수집(공백만 있어도 포함).
+    조문 1:1 + front_matter/headnote/gap 보강(옵션)
+    Strict 모드:
+      - headnote 길이 필터 비활성(=0 취급)
+      - 최종 정리 후 남은 간극을 post-fill로 모두 orphan_gap 생성(공백-only 포함)
     """
     text = result.full_text
     total_len = len(text)
     chunks: List[Chunk] = []
+    diag: Dict[str, Any] = {
+        "headnote_candidates": 0,
+        "headnote_after_filter": 0,
+        "short_headnotes_removed": 0,
+        "strict_post_fill": {"enabled": bool(strict_lossless), "filled_gaps": 0, "total_chars": 0, "spans": []},
+        "allowed_headnote_levels_effective": list(allowed_headnote_levels) + ["บท* (prefix)"],
+    }
 
     # 1) article leaves
     leaves = _collect_article_leaves(result.root)
@@ -222,7 +231,6 @@ def make_chunks(
         for n in result.root.children:
             if n.label == "front_matter" and (n.span_end - n.span_start) > 0:
                 frag = text[n.span_start:n.span_end]
-                # strict가 아니면 완전 공백은 제외
                 if strict_lossless or frag.strip():
                     crumbs = ["front_matter"]
                     meta = {
@@ -247,17 +255,25 @@ def make_chunks(
                     )
                 break
 
-    # 3) headnotes (레벨 제한 + 최소 길이)
+    # 3) headnotes (레벨+이명 허용 / Strict면 길이 필터 해제)
     if include_headnotes:
         allowed = set(allowed_headnote_levels)
+        def is_allowed_label(lbl: Optional[str]) -> bool:
+            if not lbl:
+                return False
+            return (lbl in allowed) or lbl.startswith("บท")  # 이명 허용
+
         def walk(parent: Node):
-            if parent.label in allowed:
+            nonlocal diag
+            if is_allowed_label(parent.label):
                 child_spans = [(c.span_start, c.span_end) for c in parent.children]
                 covered = _compute_union(child_spans)
                 leftovers = _subtract_intervals((parent.span_start, parent.span_end), covered)
                 for (s, e) in leftovers:
                     frag = text[s:e]
-                    if (strict_lossless and (e - s) > 0) or (len(frag.strip()) >= min_headnote_len):
+                    diag["headnote_candidates"] += 1
+                    keep = (e - s) > 0 if strict_lossless else (len(frag.strip()) >= min_headnote_len)
+                    if keep:
                         crumbs = _breadcrumbs(parent, result)
                         section_label = f"{parent.label} {parent.num}".strip() if parent.num else parent.label or "headnote"
                         section_uid = ("/".join(crumbs) if crumbs else section_label) + " — headnote"
@@ -281,11 +297,14 @@ def make_chunks(
                                 meta=meta,
                             )
                         )
+                        diag["headnote_after_filter"] += 1
+                    else:
+                        diag["short_headnotes_removed"] += 1
             for c in parent.children:
                 walk(c)
         walk(result.root)
 
-    # 4) gap-sweeper (Strict면 길이 무관, 아니면 min_gap_len 기준)
+    # 4) 1차 gap-sweeper
     if include_gap_fallback:
         ivs = _compute_union([(c.span_start, c.span_end) for c in chunks])
         gaps: List[Tuple[int, int]] = []
@@ -333,15 +352,12 @@ def make_chunks(
         s, e = c.span_start, c.span_end
         if s is None or e is None or e <= s:
             continue
-        # 항상 소스 기준으로 텍스트 재생성(불일치 0 보장)
-        c.text = text[s:e]
-        # Strict가 아니면 완전 공백 청크는 제거
+        c.text = text[s:e]  # 원문으로 재동기화
         if not strict_lossless and c.text.strip() == "":
             continue
         cleaned.append(c)
     chunks = cleaned
 
-    # 동일 (span_start, span_end) 중복 제거
     seen_span = set()
     dedup1: List[Chunk] = []
     for c in chunks:
@@ -352,23 +368,70 @@ def make_chunks(
         dedup1.append(c)
     chunks = dedup1
 
-    # 연속 겹침 → 뒤 청크 전방 클립
     final: List[Chunk] = []
     last_end = -1
     for c in chunks:
         s, e = c.span_start, c.span_end
         if last_end > -1 and s < last_end:
-            s = last_end
+            s = last_end  # 전방 클립
         if e - s <= 0:
             continue
-        # Strict면 orphan_gap은 길이 제한 없이 유지, 그 외는 필터
         if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
             if not strict_lossless or c.meta.get("type") != "orphan_gap":
-                if (e - s) < (min_headnote_len if c.meta.get("type")=="headnote" else min_gap_len):
+                thr = min_headnote_len if c.meta.get("type")=="headnote" else min_gap_len
+                if (e - s) < thr:
+                    # Strict OFF에서 짧은 머리말/갭 제거
+                    if c.meta.get("type") == "headnote":
+                        diag["short_headnotes_removed"] += 1
                     continue
         c.span_start, c.span_end = s, e
         c.text = text[s:e]
         final.append(c)
         last_end = e
 
-    return final
+    # ── Strict 전용 post-fill: 마지막까지 남은 간극 모두 메움 ── #
+    if strict_lossless:
+        ivs2 = _compute_union([(c.span_start, c.span_end) for c in final])
+        post_gaps: List[Tuple[int, int]] = []
+        prev = 0
+        for s, e in ivs2:
+            if s > prev:
+                post_gaps.append((prev, s))
+            prev = e
+        if prev < total_len:
+            post_gaps.append((prev, total_len))
+
+        for (s, e) in post_gaps:
+            if e <= s:
+                continue
+            frag = text[s:e]   # 공백-only라도 포함
+            crumbs = _find_path_at_offset(result, s)
+            meta = {
+                "type": "orphan_gap",
+                "mode": mode,
+                "doc_type": result.doc_type,
+                "law_name": law_name or "",
+                "section_label": f"strict_fill_gap[{s}:{e}]",
+                "section_uid": f"strict_gap[{s}:{e}]",
+                "source_file": source_file or "",
+                "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
+                "strict_fill": "1",
+            }
+            final.append(
+                Chunk(
+                    text=frag,
+                    span_start=s,
+                    span_end=e,
+                    node_ids=[],
+                    breadcrumbs=crumbs,
+                    meta=meta,
+                )
+            )
+            diag["strict_post_fill"]["filled_gaps"] += 1
+            diag["strict_post_fill"]["total_chars"] += (e - s)
+            if len(diag["strict_post_fill"]["spans"]) < 5:
+                diag["strict_post_fill"]["spans"].append([s, e])
+
+        final.sort(key=lambda c: (c.span_start, c.span_end))
+
+    return final, diag

@@ -41,7 +41,7 @@ def make_zip_bundle(
     buf.seek(0)
     return buf
 
-# ───────────────────────────── REPORT helpers ───────────────────────────── #
+# ───────────────────────────── helpers ───────────────────────────── #
 
 def _span_union(chunks: List[Chunk]) -> Tuple[int, List[Tuple[int,int]]]:
     ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
@@ -156,7 +156,6 @@ def _percentiles(vals: List[int]) -> Dict[str, float]:
     }
 
 def _histogram(vals: List[int]) -> Dict[str, int]:
-    # 의사결정에 쓰기 좋은 버킷
     buckets = [(0,200),(200,500),(500,1000),(1000,2000),(2000,5000),(5000,10**9)]
     names = ["0-200","200-500","500-1000","1000-2000","2000-5000","5000+"]
     counts = {n:0 for n in names}
@@ -172,9 +171,7 @@ def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
     lens = [len(c.text) for c in arts]
     sizes = _percentiles(lens)
     hist = _histogram(lens)
-    # 시리즈별(조문 번호 재시작 구간) 분포
     by_series: Counter = Counter(c.meta.get("series","1") for c in arts)
-    # 최장/최단 조문 라벨
     arts_sorted = sorted(arts, key=lambda c: len(c.text))
     shortest = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[:5]]
     longest  = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
@@ -216,6 +213,11 @@ def make_debug_report(
     for c in chunks:
         type_sizes[c.meta.get("type","article")] += len(c.text)
 
+    # make_chunks 진단(있으면)
+    mk_diag = (debug or {}).get("make_chunks_diag", {}) if debug else {}
+    strict_post_fill = mk_diag.get("strict_post_fill", {"enabled": False, "filled_gaps": 0, "total_chars": 0, "spans": []})
+    short_headnotes_removed = mk_diag.get("short_headnotes_removed", 0)
+
     report = {
         "source_file": source_file,
         "law_name": law_name,
@@ -239,8 +241,10 @@ def make_debug_report(
             "source_article_count": _count_articles_in_source(full),
             "chunk_article_count": sum(1 for c in chunks if c.meta.get("type","article")=="article")
         },
-        # ⬇️ 조문 크기 통계 추가
         "article_size_stats": _article_size_stats(chunks),
+        # ⬇️ 새 디버그 항목
+        "strict_post_fill": strict_post_fill,
+        "short_headnotes_removed": short_headnotes_removed,
         "sample_chunk_head": (chunks[0].text[:400] if chunks else ""),
         "debug": debug or {},
         "timestamp": datetime.utcnow().isoformat() + "Z",
