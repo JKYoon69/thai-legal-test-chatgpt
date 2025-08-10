@@ -2,6 +2,6 @@ streamlit>=1.36.0
 pydantic>=2.8.0
 regex
 streamlit-extras==0.4.0
-openai>=1.40.0
-google-generativeai>=0.7.2
-jsonschema>=4.22.0
+openai>=1.40,<2      # Responses API 포함
+google-genai>=0.3    # (신규 Gemini 클라이언트, 구버전은 google-generativeai)
+jsonschema>=4.20
