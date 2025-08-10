@@ -1,23 +1,27 @@
 # -*- coding: utf-8 -*-
-import time, json, math, hashlib
+import time, json, math
 from typing import List, Dict, Any, Tuple
 import streamlit as st
 
+# 파서/후처리
 from parser_core.parser import detect_doc_type, parse_document
-from parser_core.postprocess import validate_tree, make_chunks, guess_law_name, repair_tree
+from parser_core.postprocess import (
+    validate_tree, make_chunks, guess_law_name, repair_tree,
+    merge_small_trailing_parts,  # ★ NEW: 꼬리 병합 패스
+)
 from parser_core.schema import ParseResult, Chunk
+
+# 익스포트
 from exporters.writers import (
-    to_jsonl_rich_meta,
-    to_jsonl_compat_flat,
-    make_debug_report,
+    to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
 )
 
-from llm_clients import call_openai_summary, call_openai_batch
+# LLM (요약 배치/캐시)
+from llm_clients import call_openai_batch
 from extractors import build_summary_record
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)  (Batch+Cache, Dual Exports)"
+APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)  (Batch+Cache, Dual Exports + Tail-Sweep)"
 
 # ---------- 스타일 ----------
 def _inject_css():
@@ -132,7 +136,6 @@ class RunPanel:
         self.status.update(label=f"완료 · {time.time()-self.t0:.1f}s", state=("complete" if ok else "error"))
         self._update("완료", set_to=100)
 
-# --------- 유틸 ----------
 def _sha1(s: str) -> str:
     import hashlib
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
@@ -217,8 +220,17 @@ def main():
                 overlap_chars=st.session_state["overlap_chars"],
                 soft_cut=True
             )
+            panel.log(f"청크 1차 생성 {len(chunks)}개 · {time.time()-t0:.2f}s")
+
+            # ★ NEW: 분할 시리즈 마지막 꼬리(≤tail_merge_min_chars) 흡수
+            tail_threshold = st.session_state["tail_merge_min_chars"]
+            sweep_diag = merge_small_trailing_parts(chunks, full_text=result.full_text, max_tail_chars=tail_threshold)
+            if isinstance(mk_diag, dict):
+                mk_diag["micro_sweeper_tail"] = {"max_tail_chars": tail_threshold, **sweep_diag}
+            panel.log(f"마이크로 스위퍼 적용 · merged={sweep_diag['merged_count']}")
+
             arts = [c for c in chunks if c.meta.get("type")=="article"]
-            panel.log(f"청크 {len(chunks)}개 (article {len(arts)}) 생성 · {time.time()-t0:.2f}s")
+            panel.log(f"현재 청크 {len(chunks)}개 (article {len(arts)})")
             panel.tick("청킹", inc=20)
 
             # 4) LLM 요약 (배치+캐시+스킵)
@@ -336,7 +348,7 @@ def main():
 
             st.session_state["llm_errors"] = llm_errors
 
-            # 5) REPORT/JSONL (여기서 두 가지 형식 모두 생성)
+            # 5) REPORT/JSONL (두 가지 형식 동시 생성)
             panel.step("5/6 리포트/저장")
             cov=_coverage(chunks, len(result.full_text))
             report_str = make_debug_report(
@@ -362,7 +374,6 @@ def main():
                 }
             )
 
-            # 두 가지 JSONL
             jsonl_rich = to_jsonl_rich_meta(chunks)
             jsonl_flat = to_jsonl_compat_flat(chunks, parse_result=result)
 
@@ -402,7 +413,6 @@ def main():
                     st.code(e)
 
         st.markdown('<div class="dlbar">', unsafe_allow_html=True)
-        # 두 가지 JSONL 모두 제공
         st.download_button("JSONL 다운로드 — Rich Meta", st.session_state["chunks_jsonl_rich"].encode("utf-8"),
                            file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks_rich.jsonl",
                            mime="application/json", key="dl-jsonl-rich")

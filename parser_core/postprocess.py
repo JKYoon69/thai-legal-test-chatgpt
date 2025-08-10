@@ -713,3 +713,87 @@ def make_chunks(
         final.sort(key=lambda c: (c.span_start, c.span_end))
 
     return final, diag
+
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+import re
+from typing import List, Dict, Any, Tuple
+
+# ... (기존 코드들 그대로 두세요)
+
+PART_RE = re.compile(r"^(?P<base>.+?)\s*\(part\s*(?P<idx>\d+)\)\s*$", re.IGNORECASE)
+
+def _part_info(label: str) -> Tuple[str, int | None]:
+    """
+    'มาตรา 119 (part 2)' -> ('มาตรา 119', 2)
+    'มาตรา 119' -> ('มาตรา 119', None)
+    """
+    if not isinstance(label, str):
+        return ("", None)
+    m = PART_RE.match(label.strip())
+    if not m:
+        return (label.strip(), None)
+    return (m.group("base").strip(), int(m.group("idx")))
+
+def merge_small_trailing_parts(
+    chunks: List["Chunk"],
+    *,
+    full_text: str,
+    max_tail_chars: int = 200
+) -> Dict[str, Any]:
+    """
+    분할 시리즈의 마지막(part N) 꼬리가 너무 짧으면 앞 청크로 병합.
+    - 같은 series(base)가 맞고, 현재가 마지막(part N), 길이<=max_tail_chars일 때만
+    - 병합: prev.span_end 및 prev.core_span[1]을 curr의 끝까지 확장하고 curr 제거
+    반환: {'merged_count':int, 'affected_sections':[...]}
+    """
+    if not chunks:
+        return {"merged_count": 0, "affected_sections": []}
+
+    # span 순서로 가정 (make_chunks가 이미 정렬)
+    merged = 0
+    affected: List[str] = []
+    i = 1
+    while i < len(chunks):
+        prev = chunks[i - 1]
+        curr = chunks[i]
+        if (prev.meta.get("type") == "article" and curr.meta.get("type") == "article"):
+            prev_label = prev.meta.get("section_label", "")
+            curr_label = curr.meta.get("section_label", "")
+            prev_base, prev_idx = _part_info(prev_label)
+            curr_base, curr_idx = _part_info(curr_label)
+
+            # 같은 시리즈의 연속 파트인지 확인
+            is_series = (prev_base and curr_base and prev_base == curr_base and
+                         prev_idx is not None and curr_idx is not None and curr_idx == prev_idx + 1)
+
+            curr_len = int(curr.span_end) - int(curr.span_start)
+
+            if is_series and curr_len <= int(max_tail_chars):
+                # 병합
+                # core_span 보정
+                prev_core = prev.meta.get("core_span", [prev.span_start, prev.span_end])
+                curr_core = curr.meta.get("core_span", [curr.span_start, curr.span_end])
+
+                try:
+                    prev.meta["core_span"] = [int(prev_core[0]), int(curr_core[1])]
+                except Exception:
+                    prev.meta["core_span"] = [prev.span_start, curr.span_end]
+
+                # span/text 확장
+                prev.span_end = int(curr.span_end)
+                try:
+                    prev.text = full_text[int(prev.span_start):int(prev.span_end)]
+                except Exception:
+                    # 안전 폴백: 텍스트는 그대로 두되 span만 확장
+                    pass
+
+                # 현재 조각 제거
+                del chunks[i]
+                merged += 1
+                affected.append(prev_base)
+                # i는 그대로(다음 항목이 앞으로 땡겨졌으니 같은 i 인덱스를 다시 검사)
+                continue
+        i += 1
+
+    return {"merged_count": merged, "affected_sections": affected}
