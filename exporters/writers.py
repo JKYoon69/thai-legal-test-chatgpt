@@ -135,6 +135,60 @@ def _largest_gaps(full_text: str, chunks: List[Chunk], topn: int = 5) -> List[Di
     gaps_sorted = sorted(gaps, key=lambda g: (g[1]-g[0]), reverse=True)[:topn]
     return [{"span": [s,e], "len": e-s, "preview": snip(s,e)} for s,e in gaps_sorted]
 
+# ───────────────────────────── 조문 크기 통계 ───────────────────────────── #
+
+def _percentiles(vals: List[int]) -> Dict[str, float]:
+    if not vals:
+        return {"p25":0,"p50":0,"p75":0,"min":0,"max":0,"mean":0.0}
+    s = sorted(vals)
+    def q(p: float) -> float:
+        k = (len(s)-1)*p
+        a = int(k); b = a+1
+        if b >= len(s): return float(s[a])
+        return float(s[a] + (s[b]-s[a])*(k-a))
+    return {
+        "min": float(s[0]),
+        "p25": q(0.25),
+        "p50": q(0.50),
+        "p75": q(0.75),
+        "max": float(s[-1]),
+        "mean": float(sum(s)/len(s)),
+    }
+
+def _histogram(vals: List[int]) -> Dict[str, int]:
+    # 의사결정에 쓰기 좋은 버킷
+    buckets = [(0,200),(200,500),(500,1000),(1000,2000),(2000,5000),(5000,10**9)]
+    names = ["0-200","200-500","500-1000","1000-2000","2000-5000","5000+"]
+    counts = {n:0 for n in names}
+    for v in vals:
+        for (lo,hi),name in zip(buckets,names):
+            if lo <= v < hi:
+                counts[name] += 1
+                break
+    return counts
+
+def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
+    arts = [c for c in chunks if c.meta.get("type","article")=="article"]
+    lens = [len(c.text) for c in arts]
+    sizes = _percentiles(lens)
+    hist = _histogram(lens)
+    # 시리즈별(조문 번호 재시작 구간) 분포
+    by_series: Counter = Counter(c.meta.get("series","1") for c in arts)
+    # 최장/최단 조문 라벨
+    arts_sorted = sorted(arts, key=lambda c: len(c.text))
+    shortest = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[:5]]
+    longest  = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
+    return {
+        "count": len(arts),
+        "length_stats_chars": sizes,
+        "length_histogram": hist,
+        "series_counts": dict(by_series),
+        "top_shortest": shortest,
+        "top_longest": longest,
+    }
+
+# ───────────────────────────── REPORT ───────────────────────────── #
+
 def make_debug_report(
     parse_result: ParseResult,
     chunks: List[Chunk],
@@ -148,6 +202,7 @@ def make_debug_report(
     src_len = len(full)
     coverage = (union_len / src_len) if src_len else 0.0
 
+    # integrity
     integ = _overlap_diagnostics(chunks)
     mismatches = 0
     for c in chunks:
@@ -155,6 +210,7 @@ def make_debug_report(
             mismatches += 1
     integ["text_mismatches"] = mismatches
 
+    # types
     type_counts = Counter(c.meta.get("type","article") for c in chunks)
     type_sizes = Counter()
     for c in chunks:
@@ -183,6 +239,8 @@ def make_debug_report(
             "source_article_count": _count_articles_in_source(full),
             "chunk_article_count": sum(1 for c in chunks if c.meta.get("type","article")=="article")
         },
+        # ⬇️ 조문 크기 통계 추가
+        "article_size_stats": _article_size_stats(chunks),
         "sample_chunk_head": (chunks[0].text[:400] if chunks else ""),
         "debug": debug or {},
         "timestamp": datetime.utcnow().isoformat() + "Z",

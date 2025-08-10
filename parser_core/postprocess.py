@@ -155,9 +155,11 @@ def make_chunks(
     allowed_headnote_levels: List[str] = ("ภาค","ลักษณะ","หมวด","ส่วน","บท"),
     min_headnote_len: int = 24,
     min_gap_len: int = 24,
+    strict_lossless: bool = False,
 ) -> List[Chunk]:
     """
-    조문 1:1 + front_matter/headnote/gap 보강(옵션) + 중복/겹침 억제
+    조문 1:1 + front_matter/headnote/gap 보강(옵션) + Strict 무손실(선택)
+    - strict_lossless=True인 경우: gap-sweeper가 길이 무관으로 모든 간극을 orphan_gap으로 수집(공백만 있어도 포함).
     """
     text = result.full_text
     total_len = len(text)
@@ -220,7 +222,8 @@ def make_chunks(
         for n in result.root.children:
             if n.label == "front_matter" and (n.span_end - n.span_start) > 0:
                 frag = text[n.span_start:n.span_end]
-                if frag.strip():
+                # strict가 아니면 완전 공백은 제외
+                if strict_lossless or frag.strip():
                     crumbs = ["front_matter"]
                     meta = {
                         "type": "front_matter",
@@ -254,7 +257,7 @@ def make_chunks(
                 leftovers = _subtract_intervals((parent.span_start, parent.span_end), covered)
                 for (s, e) in leftovers:
                     frag = text[s:e]
-                    if len(frag.strip()) >= min_headnote_len:
+                    if (strict_lossless and (e - s) > 0) or (len(frag.strip()) >= min_headnote_len):
                         crumbs = _breadcrumbs(parent, result)
                         section_label = f"{parent.label} {parent.num}".strip() if parent.num else parent.label or "headnote"
                         section_uid = ("/".join(crumbs) if crumbs else section_label) + " — headnote"
@@ -282,7 +285,7 @@ def make_chunks(
                 walk(c)
         walk(result.root)
 
-    # 4) gap-sweeper (짧은 gap은 무시)
+    # 4) gap-sweeper (Strict면 길이 무관, 아니면 min_gap_len 기준)
     if include_gap_fallback:
         ivs = _compute_union([(c.span_start, c.span_end) for c in chunks])
         gaps: List[Tuple[int, int]] = []
@@ -295,8 +298,11 @@ def make_chunks(
             gaps.append((prev, total_len))
 
         for idx, (s, e) in enumerate(gaps, 1):
+            if e <= s:
+                continue
             frag = text[s:e]
-            if len(frag.strip()) >= min_gap_len:
+            keep = (e - s) > 0 if strict_lossless else (len(frag.strip()) >= min_gap_len)
+            if keep:
                 crumbs = _find_path_at_offset(result, s)
                 meta = {
                     "type": "orphan_gap",
@@ -327,12 +333,15 @@ def make_chunks(
         s, e = c.span_start, c.span_end
         if s is None or e is None or e <= s:
             continue
-        c.text = text[s:e]  # 항상 소스 기준 재생성
-        if c.text.strip() == "":
+        # 항상 소스 기준으로 텍스트 재생성(불일치 0 보장)
+        c.text = text[s:e]
+        # Strict가 아니면 완전 공백 청크는 제거
+        if not strict_lossless and c.text.strip() == "":
             continue
         cleaned.append(c)
     chunks = cleaned
 
+    # 동일 (span_start, span_end) 중복 제거
     seen_span = set()
     dedup1: List[Chunk] = []
     for c in chunks:
@@ -343,17 +352,20 @@ def make_chunks(
         dedup1.append(c)
     chunks = dedup1
 
+    # 연속 겹침 → 뒤 청크 전방 클립
     final: List[Chunk] = []
     last_end = -1
     for c in chunks:
         s, e = c.span_start, c.span_end
         if last_end > -1 and s < last_end:
-            s = last_end  # 뒤 청크 전방 클립
+            s = last_end
         if e - s <= 0:
             continue
+        # Strict면 orphan_gap은 길이 제한 없이 유지, 그 외는 필터
         if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
-            if (e - s) < min( min_headnote_len if c.meta.get("type")=="headnote" else min_gap_len, 8):
-                continue
+            if not strict_lossless or c.meta.get("type") != "orphan_gap":
+                if (e - s) < (min_headnote_len if c.meta.get("type")=="headnote" else min_gap_len):
+                    continue
         c.span_start, c.span_end = s, e
         c.text = text[s:e]
         final.append(c)

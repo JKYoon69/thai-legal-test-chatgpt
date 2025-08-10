@@ -6,30 +6,11 @@ from typing import List
 
 import streamlit as st
 
-# ─────────────────────────────────────────────
-# Always prefer the package layout (parser_core/*)
-# Fallback to flat files only if needed.
-# ─────────────────────────────────────────────
-try:
-    from parser_core.parser import detect_doc_type, parse_document
-    from parser_core.postprocess import validate_tree, make_chunks, guess_law_name
-    from parser_core.schema import ParseResult, Node, Chunk
-    from exporters import writers as wr
-    IMPORT_FLAVOR = "parser_core/*"
-except Exception:
-    try:
-        from parser import detect_doc_type, parse_document
-        from postprocess import validate_tree, make_chunks, guess_law_name
-        from schema import ParseResult, Node, Chunk
-        import writers as wr
-        IMPORT_FLAVOR = "flat *.py"
-    except Exception as e:
-        raise ImportError(
-            "Cannot import parsing modules. Expected either:\n"
-            "  - parser_core/{parser,postprocess,schema}.py + exporters/writers.py\n"
-            "  - or flat files {parser,postprocess,schema,writers}.py in the app root.\n"
-            f"Original import error: {e}"
-        ) from e
+# 패키지 레이아웃을 우선 사용
+from parser_core.parser import detect_doc_type, parse_document
+from parser_core.postprocess import validate_tree, make_chunks, guess_law_name
+from parser_core.schema import ParseResult, Node, Chunk
+from exporters import writers as wr
 
 APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
 
@@ -58,13 +39,15 @@ def _ensure_state():
         "chunks": [],
         "issues": [],
         "mode": "article_only",
-        # lossless / noise-control (also saved into REPORT.run_config)
+        # 손실 방지 / 노이즈 억제 옵션 (REPORT에 기록)
         "include_front_matter": True,
         "include_headnotes": True,
         "include_gap_fallback": True,
         "allowed_headnote_levels": ["ภาค","ลักษณะ","หมวด","ส่วน","บท"],
         "min_headnote_len": 24,
         "min_gap_len": 24,
+        # Strict 무손실(coverage=1.0 보장)
+        "strict_lossless": False,
         "show_raw": False,
     }.items():
         st.session_state.setdefault(k, v)
@@ -85,7 +68,7 @@ def main():
     _ensure_state()
 
     st.title(APP_TITLE)
-    st.caption(f"Imports: **{IMPORT_FLAVOR}** · Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
+    st.caption("Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
 
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
 
@@ -95,7 +78,7 @@ def main():
     with colB:
         st.session_state["show_raw"] = st.checkbox("원문(raw) 보기", value=st.session_state["show_raw"])
     with colC:
-        st.write("")
+        st.session_state["strict_lossless"] = st.checkbox("Strict 무손실(coverage=1.0)", value=st.session_state["strict_lossless"])
 
     st.markdown("**손실 방지 / 노이즈 억제 옵션 (REPORT에 기록됩니다)**")
     oc1, oc2, oc3 = st.columns(3)
@@ -157,6 +140,7 @@ def main():
             allowed_headnote_levels=list(st.session_state["allowed_headnote_levels"]),
             min_headnote_len=int(st.session_state["min_headnote_len"]),
             min_gap_len=int(st.session_state["min_gap_len"]),
+            strict_lossless=bool(st.session_state["strict_lossless"]),
         )
         t5 = time.time()
 
@@ -178,7 +162,7 @@ def main():
             "allowed_headnote_levels": list(st.session_state["allowed_headnote_levels"]),
             "min_headnote_len": int(st.session_state["min_headnote_len"]),
             "min_gap_len": int(st.session_state["min_gap_len"]),
-            "import_flavor": IMPORT_FLAVOR,
+            "strict_lossless": bool(st.session_state["strict_lossless"]),
         }
         st.session_state["debug"] = {
             "timings_sec": {
