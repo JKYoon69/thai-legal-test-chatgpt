@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
 import io
 import json
+import time
 from typing import List, Optional, Tuple
 
 import streamlit as st
 
-from parser_core.parser import detect_doc_type, parse_document
-from parser_core.postprocess import (
+from parser import detect_doc_type, parse_document
+from postprocess import (
     validate_tree,
     make_chunks,
     guess_law_name,
 )
-from parser_core.schema import ParseResult, Node, Chunk
-from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
+from schema import ParseResult, Node, Chunk
+import writers as wr
 
-APP_TITLE = "Thai Legal Preprocessor — Hybrid Multi-Modal RAG"
+APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
 
 # ───────────────────────────────── UI Helpers ───────────────────────────────── #
 
@@ -23,25 +24,18 @@ def _inject_css():
         """
         <style>
           .block-container { max-width: 1400px !important; padding-top: .75rem; }
-          .toolbar { position: sticky; top: 0; z-index: 10; padding: .5rem 0 .75rem; 
-                     background: var(--background-color); border-bottom: 1px solid rgba(128,128,128,.25);}
+          .toolbar { position: sticky; top: 0; z-index: 10; padding: .5rem 0 .75rem;
+                     background: var(--background-color); border-bottom: 1px solid rgba(128,128,128,.25); }
           .code-like { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; white-space: pre-wrap; }
           mark { background: #fff3bf; padding: 0 .15rem; border-radius: .2rem; }
           .tree-pane { font-size: .95rem; line-height: 1.25rem; }
           .tree-row { display: flex; align-items: center; gap: .5rem; margin: .1rem 0; }
           .tree-label { padding: .1rem .25rem; border-radius: .35rem; }
-          .depth-1 .tree-label{ background: rgba(0,0,0,.06); }
-          .depth-2 .tree-label{ background: rgba(0,0,0,.05); }
-          .depth-3 .tree-label{ background: rgba(0,0,0,.04); }
-          .depth-4 .tree-label{ background: rgba(0,0,0,.03); }
           .indent { height: 1px; width: var(--indent, 0px); }
           .badge { background: #e7f5ff; border: 1px solid #d0ebff; padding: .05rem .35rem; border-radius: .5rem; font-size: .72rem; }
           @media (prefers-color-scheme: dark){
             .badge { background: rgba(56, 139, 253,.15); border-color: rgba(56,139,253,.35); }
-            .depth-1 .tree-label{ background: rgba(255,255,255,.06); }
-            .depth-2 .tree-label{ background: rgba(255,255,255,.05); }
-            .depth-3 .tree-label{ background: rgba(255,255,255,.04); }
-            .depth-4 .tree-label{ background: rgba(255,255,255,.03); }
+            .tree-label{ background: rgba(255,255,255,.06); }
           }
         </style>
         """,
@@ -60,63 +54,15 @@ def _ensure_state():
         "issues": [],
         "sel_id": None,
         "mode": "article_only",
-        # toggles
+        # lossless / noise control options (REPORT에 기록)
         "include_front_matter": True,
         "include_headnotes": True,
         "include_gap_fallback": True,
-        "min_headnote_len": 12,
-        "min_gap_len": 10,
+        "allowed_headnote_levels": ["ภาค","ลักษณะ","หมวด","ส่วน","บท"],  # 과다 생성 방지시 줄이기
+        "min_headnote_len": 24,   # 너무 짧은 머리말은 노이즈
+        "min_gap_len": 24,        # 자잘한 gap은 버림
     }.items():
         st.session_state.setdefault(k, v)
-
-def _flatten_with_depth(nodes: List[Node], depth: int = 0) -> List[Tuple[Node, int]]:
-    out: List[Tuple[Node, int]] = []
-    for n in nodes:
-        out.append((n, depth))
-        if n.children:
-            out.extend(_flatten_with_depth(n.children, depth + 1))
-    return out
-
-def render_tree_and_select(result: ParseResult):
-    st.subheader("문서 트리")
-    if not result or not result.root.children:
-        st.info("트리에 표시할 노드가 없습니다.")
-        return
-
-    flat = _flatten_with_depth(result.root.children, depth=0)
-    for n, depth in flat:
-        indent_px = 14 * depth
-        cols = st.columns([1, 5, 1])
-        with cols[0]:
-            st.markdown(f"<div class='indent' style='--indent:{indent_px}px'></div>", unsafe_allow_html=True)
-        with cols[1]:
-            lbl = f"{(n.label or '')} {('' if not n.num else n.num)}".strip()
-            st.markdown(
-                f"<div class='tree-pane depth-{min(depth,4)}'><span class='tree-label'>{lbl} "
-                f"<span class='badge'>L{n.level}</span></span></div>",
-                unsafe_allow_html=True,
-            )
-        with cols[2]:
-            if st.button("보기", key=f"view-{n.node_id}"):
-                st.session_state["sel_id"] = n.node_id
-
-    st.caption(f"전체 노드: {len(result.all_nodes)}")
-
-def highlight_text(full_text: str, spans: List[tuple]) -> str:
-    if not spans:
-        return f"<div class='code-like'>{full_text}</div>"
-    html = []
-    last = 0
-    for (s, e) in sorted(spans, key=lambda x: x[0]):
-        s = max(0, min(s, len(full_text)))
-        e = max(0, min(e, len(full_text)))
-        if s > last:
-            html.append(full_text[last:s])
-        html.append(f"<mark>{full_text[s:e]}</mark>")
-        last = e
-    if last < len(full_text):
-        html.append(full_text[last:])
-    return f"<div class='code-like'>{''.join(html)}</div>"
 
 def _coverage(chunks: List[Chunk], total_len: int) -> float:
     ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
@@ -136,37 +82,33 @@ def main():
     _ensure_state()
 
     st.title(APP_TITLE)
-    st.caption("Upload a Thai legal .txt (UTF-8). Click [파싱] to build hierarchy → chunk → export for hybrid RAG (pgroonga + pgvector).")
+    st.caption("Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
 
     # inputs
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
 
-    left, right = st.columns(2)
-    with left:
-        st.session_state["mode"] = st.selectbox(
-            "청크 모드",
-            options=["article_only"],  # 현재 단계는 조문 단위 고정
-            index=0,
-            help="현재 단계는 조문 단위 트리 확정(병합/분할 없음)"
-        )
-    with right:
+    colA, colB, colC = st.columns(3)
+    with colA:
+        st.session_state["mode"] = st.selectbox("청크 모드", options=["article_only"], index=0)
+    with colB:
         show_raw = st.checkbox("원문(raw) 보기", value=False)
+    with colC:
+        pass
 
-    # options for lossless coverage
-    st.markdown("**손실 방지 옵션**")
+    st.markdown("**손실 방지 / 노이즈 억제 옵션 (REPORT에 기록됩니다)**")
     oc1, oc2, oc3 = st.columns(3)
     with oc1:
         st.session_state["include_front_matter"] = st.checkbox("front matter 포함", value=st.session_state["include_front_matter"])
     with oc2:
-        st.session_state["include_headnotes"] = st.checkbox("headnote 포함(상위 헤더 머리말)", value=st.session_state["include_headnotes"])
+        st.session_state["include_headnotes"] = st.checkbox("headnote 포함", value=st.session_state["include_headnotes"])
     with oc3:
-        st.session_state["include_gap_fallback"] = st.checkbox("gap-sweeper(최종 보강)", value=st.session_state["include_gap_fallback"])
+        st.session_state["include_gap_fallback"] = st.checkbox("gap-sweeper 포함", value=st.session_state["include_gap_fallback"])
 
     sc1, sc2 = st.columns(2)
     with sc1:
-        st.session_state["min_headnote_len"] = st.number_input("headnote 최소 길이(문자)", min_value=0, max_value=200, value=st.session_state["min_headnote_len"])
+        st.session_state["min_headnote_len"] = st.number_input("headnote 최소 길이(문자)", min_value=0, max_value=400, value=st.session_state["min_headnote_len"])
     with sc2:
-        st.session_state["min_gap_len"] = st.number_input("gap 보강 최소 길이(문자)", min_value=0, max_value=200, value=st.session_state["min_gap_len"])
+        st.session_state["min_gap_len"] = st.number_input("gap 보강 최소 길이(문자)", min_value=0, max_value=400, value=st.session_state["min_gap_len"])
 
     parse_clicked = st.button("파싱")
 
@@ -184,28 +126,38 @@ def main():
             st.warning("먼저 파일을 업로드하세요.")
             return
 
+        t0 = time.time()
         text = st.session_state["text"]
         source_file = st.session_state["source_file"]
-        mode = st.session_state["mode"]
 
-        # detect → parse
+        # 1) detect
+        t1 = time.time()
         doc_type = detect_doc_type(text)
-        result: ParseResult = parse_document(text, doc_type=doc_type)
+        t2 = time.time()
 
-        # metadata and chunks
-        law_name = guess_law_name(text)
+        # 2) parse
+        result: ParseResult = parse_document(text, doc_type=doc_type)
+        t3 = time.time()
+
+        # 3) validate
         issues = validate_tree(result)
+        t4 = time.time()
+
+        # 4) chunks
+        law_name = guess_law_name(text)
         chunks: List[Chunk] = make_chunks(
             result=result,
-            mode=mode,
+            mode=st.session_state["mode"],
             source_file=source_file,
             law_name=law_name,
             include_front_matter=st.session_state["include_front_matter"],
             include_headnotes=st.session_state["include_headnotes"],
             include_gap_fallback=st.session_state["include_gap_fallback"],
+            allowed_headnote_levels=list(st.session_state["allowed_headnote_levels"]),
             min_headnote_len=int(st.session_state["min_headnote_len"]),
             min_gap_len=int(st.session_state["min_gap_len"]),
         )
+        t5 = time.time()
 
         # store
         st.session_state["doc_type"] = doc_type
@@ -214,15 +166,35 @@ def main():
         st.session_state["chunks"] = chunks
         st.session_state["issues"] = issues
         st.session_state["parsed"] = True
-        st.session_state["sel_id"] = None  # reset selection
+        st.session_state["sel_id"] = None
 
-    # toolbar
+        # run config / debug → REPORT
+        st.session_state["run_config"] = {
+            "mode": st.session_state["mode"],
+            "include_front_matter": st.session_state["include_front_matter"],
+            "include_headnotes": st.session_state["include_headnotes"],
+            "include_gap_fallback": st.session_state["include_gap_fallback"],
+            "allowed_headnote_levels": list(st.session_state["allowed_headnote_levels"]),
+            "min_headnote_len": int(st.session_state["min_headnote_len"]),
+            "min_gap_len": int(st.session_state["min_gap_len"]),
+        }
+        st.session_state["debug"] = {
+            "timings_sec": {
+                "detect": round(t2 - t1, 6),
+                "parse": round(t3 - t2, 6),
+                "validate": round(t4 - t3, 6),
+                "make_chunks": round(t5 - t4, 6),
+                "total": round(t5 - t0, 6),
+            }
+        }
+
+    # toolbar / export
     if st.session_state["parsed"]:
         cov = _coverage(st.session_state["chunks"], len(st.session_state["result"].full_text))
         with st.container():
             st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
-            tcol1, tcol2, tcol3, _ = st.columns([2.5, 1.2, 1.2, 3])
-            with tcol1:
+            c1,c2,c3,_ = st.columns([3,1.2,1.2,3])
+            with c1:
                 st.write(
                     f"**파일:** {st.session_state['source_file']}  |  "
                     f"**doc_type:** {st.session_state['doc_type']}  |  "
@@ -230,62 +202,28 @@ def main():
                     f"**chunks:** {len(st.session_state['chunks'])}  |  "
                     f"**coverage:** {cov:.6f}"
                 )
-            with tcol2:
-                jsonl_bytes = to_jsonl(st.session_state["chunks"]).encode("utf-8")
-                st.download_button(
-                    "JSONL 다운로드",
-                    data=jsonl_bytes,
-                    file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks.jsonl",
-                    mime="application/json",
-                    key="dl-jsonl-top",
-                )
-            with tcol3:
-                zip_bytes = make_zip_bundle(
+            with c2:
+                jsonl_bytes = wr.to_jsonl(st.session_state["chunks"]).encode("utf-8")
+                st.download_button("JSONL 다운로드", data=jsonl_bytes,
+                                   file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks.jsonl",
+                                   mime="application/json", key="dl-jsonl-top")
+            with c3:
+                zip_bytes = wr.make_zip_bundle(
                     source_text=st.session_state["text"],
                     parse_result=st.session_state["result"],
                     chunks=st.session_state["chunks"],
                     source_file=st.session_state["source_file"],
                     law_name=st.session_state["law_name"] or "",
+                    run_config=st.session_state.get("run_config", {}),
+                    debug=st.session_state.get("debug", {}),
                 )
-                st.download_button(
-                    "검증 번들(ZIP)",
-                    data=zip_bytes.getvalue(),
-                    file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_bundle.zip",
-                    mime="application/zip",
-                    key="dl-zip-top",
-                )
+                st.download_button("검증 번들(ZIP)",
+                                   data=zip_bytes.getvalue(),
+                                   file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_bundle.zip",
+                                   mime="application/zip", key="dl-zip-top")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        col1, col2 = st.columns([1, 2], gap="large")
-
-        with col1:
-            render_tree_and_select(st.session_state["result"])
-            if st.session_state["issues"]:
-                with st.expander("검증 리포트(요약)", expanded=False):
-                    for it in st.session_state["issues"][:100]:
-                        st.write("• " + it)
-
-        with col2:
-            st.subheader("본문 미리보기")
-            text = st.session_state["text"]
-            if show_raw:
-                st.markdown(f"<div class='code-like'>{text}</div>", unsafe_allow_html=True)
-            else:
-                spans = []
-                sel_id = st.session_state.get("sel_id")
-                if sel_id:
-                    node = st.session_state["result"].node_map.get(sel_id)
-                    if node:
-                        spans = [(node.span_start, node.span_end)]
-                html = highlight_text(text, spans)
-                st.markdown(html, unsafe_allow_html=True)
-
-            st.caption(
-                f"메타: doc_type={st.session_state['doc_type']}, "
-                f"law_name={st.session_state['law_name'] or 'N/A'}, "
-                f"file={st.session_state['source_file']}, "
-                f"mode={st.session_state['mode']}"
-            )
+        st.info("NOTE: REPORT.json에 실행 옵션, 커버리지/중복/겹침/트리 무결성, 갭 프리뷰가 모두 기록됩니다.")
     else:
         st.info("파일을 올린 뒤 **[파싱]** 버튼을 눌러주세요.")
 
