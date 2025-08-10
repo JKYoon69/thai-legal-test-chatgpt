@@ -37,6 +37,7 @@ def _inject_css():
                            padding:.75rem 1.2rem !important; font-weight:800 !important; font-size:16px !important;
                            border-radius:10px !important; width:100%; }
       .badge-warn { display:inline-block; padding:2px 8px; border-radius:8px; background:#fee2e2; color:#b91c1c; font-weight:700; }
+      .muted { color:#9ca3af; font-size:12px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -99,6 +100,41 @@ def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, i
     if cur<N: parts.append(_esc(text[cur:N]))
     return '<div class="doc">'+"".join(parts)+"</div>"
 
+# ---------- 유틸: 사이드바 상태 패널 ----------
+class RunPanel:
+    def __init__(self):
+        with st.sidebar:
+            st.header("진행 상황")
+            self.status = st.status("대기 중...", expanded=True)
+            self.prog = st.progress(0, text="대기 중")
+            self.lines = st.container()
+        self.t0 = time.time()
+        self.total_weight = 100  # 가중치 총합(퍼센트)
+        self.done = 0
+
+    def _update_prog(self, label, inc=None, set_to=None):
+        if set_to is not None:
+            self.done = max(0, min(self.total_weight, set_to))
+        elif inc is not None:
+            self.done = max(0, min(self.total_weight, self.done + inc))
+        pct = int(self.done)
+        self.prog.progress(pct, text=f"{label} · {pct}%")
+
+    def step(self, label, state="running"):
+        self.status.update(label=label, state=state)
+
+    def log(self, text):
+        with self.lines:
+            st.markdown(f"- {text}")
+
+    def done_step(self, label, inc_weight):
+        self._update_prog(label, inc=inc_weight)
+
+    def finalize(self, ok=True):
+        elapsed = time.time() - self.t0
+        self.status.update(label=f"완료 · {elapsed:.1f}s", state=("complete" if ok else "error"))
+        self._update_prog("완료", set_to=100)
+
 # ---------- Main ----------
 def main():
     _inject_css(); _ensure_state()
@@ -136,114 +172,158 @@ def main():
         if not st.session_state["text"]:
             st.warning("먼저 파일을 업로드하세요."); return
 
-        text = st.session_state["text"]; src = st.session_state["source_file"]
+        panel = RunPanel()
+        ok = True
+        try:
+            text = st.session_state["text"]; src = st.session_state["source_file"]
 
-        # 1) parse
-        doc_type = detect_doc_type(text)
-        result: ParseResult = parse_document(text, doc_type=doc_type)
-        issues_before = validate_tree(result); rep_diag = repair_tree(result); issues_after = validate_tree(result)
+            # 1) parse (20)
+            panel.step("1/6 파싱 시작")
+            t0 = time.time()
+            doc_type = detect_doc_type(text)
+            result: ParseResult = parse_document(text, doc_type=doc_type)
+            panel.log(f"파싱 완료 · {time.time()-t0:.2f}s, doc_type={doc_type}")
+            panel.done_step("파싱", inc_weight=20)
 
-        # 2) chunks
-        base_law = guess_law_name(text)
-        chunks, mk_diag = make_chunks(
-            result=result, mode="article_only", source_file=src, law_name=base_law,
-            include_front_matter=True, include_headnotes=True, include_gap_fallback=True,
-            allowed_headnote_levels=["ภาค","ลักษณะ","หมวด","ส่วน","บท"],
-            min_headnote_len=24, min_gap_len=24, strict_lossless=st.session_state["strict_lossless"],
-            split_long_articles=st.session_state["split_long_articles"],
-            split_threshold_chars=st.session_state["split_threshold_chars"],
-            tail_merge_min_chars=st.session_state["tail_merge_min_chars"],
-            overlap_chars=st.session_state["overlap_chars"],
-            soft_cut=True
-        )
+            # 2) repair/validate (10)
+            panel.step("2/6 트리 수복/검증")
+            t0 = time.time()
+            issues_before = validate_tree(result)
+            rep_diag = repair_tree(result)
+            issues_after = validate_tree(result)
+            panel.log(f"수복 전 이슈={len(issues_before)} → 후={len(issues_after)} · {time.time()-t0:.2f}s")
+            panel.done_step("트리 수복", inc_weight=10)
 
-        # 3) LLM
-        llm_log={"law":{}, "desc":{}}
-        final_doc_type = result.doc_type or "unknown"
-        final_law = base_law or ""
-        llm_errors: List[str] = []
-
-        if st.session_state["use_llm_law"]:
-            router = LLMRouter(
-                primary_model="gpt-4.1-mini-2025-04-14",
-                fallback1_model="gemini-2.5-flash",
-                fallback2_model="gpt-5",
+            # 3) make chunks (20)
+            panel.step("3/6 청킹")
+            t0 = time.time()
+            base_law = guess_law_name(text)
+            chunks, mk_diag = make_chunks(
+                result=result, mode="article_only", source_file=src, law_name=base_law,
+                include_front_matter=True, include_headnotes=True, include_gap_fallback=True,
+                allowed_headnote_levels=["ภาค","ลักษณะ","หมวด","ส่วน","บท"],
+                min_headnote_len=24, min_gap_len=24, strict_lossless=st.session_state["strict_lossless"],
+                split_long_articles=st.session_state["split_long_articles"],
+                split_threshold_chars=st.session_state["split_threshold_chars"],
+                tail_merge_min_chars=st.session_state["tail_merge_min_chars"],
+                overlap_chars=st.session_state["overlap_chars"],
+                soft_cut=True
             )
-            obj, diag = router.lawname_doctype(text[:1600])
-            llm_log["law"]={"diag":diag,"output":obj}
-            for e in diag.get("errors", []): llm_errors.append(f'{e.get("provider")}/{e.get("model")}: {e.get("error")}')
-            if obj and obj.get("confidence",0)>=0.75:
-                final_doc_type = obj.get("doc_type") or final_doc_type
-                final_law = obj.get("law_name") or final_law
+            panel.log(f"청크 {len(chunks)}개 생성 · {time.time()-t0:.2f}s")
+            panel.done_step("청킹", inc_weight=20)
 
-        if st.session_state["use_llm_desc"]:
-            router = LLMRouter(
-                primary_model="gpt-4.1-mini-2025-04-14",
-                fallback1_model="gemini-2.5-flash",
-                fallback2_model="gpt-5",
+            # 4) LLM law meta (10)
+            final_doc_type = result.doc_type or "unknown"
+            final_law = base_law or ""
+            llm_log={"law":{}, "desc":{}}
+            llm_errors: List[str] = []
+
+            if st.session_state["use_llm_law"]:
+                panel.step("4/6 LLM 메타(법령명/유형)")
+                t0 = time.time()
+                router = LLMRouter(
+                    primary_model="gpt-4.1-mini-2025-04-14",
+                    fallback1_model="gemini-2.5-flash",
+                    fallback2_model="gpt-5",
+                )
+                obj, diag = router.lawname_doctype(text[:1600])
+                llm_log["law"]={"diag":diag,"output":obj}
+                for e in diag.get("errors", []): llm_errors.append(f'{e.get("provider")}/{e.get("model")}: {e.get("error")}')
+                if obj and obj.get("confidence",0)>=0.75:
+                    final_doc_type = obj.get("doc_type") or final_doc_type
+                    final_law = obj.get("law_name") or final_law
+                panel.log(f"LLM 메타 완료 · {time.time()-t0:.2f}s")
+            else:
+                panel.log("LLM 메타: 비활성화")
+
+            panel.done_step("LLM 메타", inc_weight=10)
+
+            # 5) LLM descriptors (30) — per-article sub progress
+            if st.session_state["use_llm_desc"]:
+                arts = [c for c in chunks if c.meta.get("type")=="article"]
+                total = max(1, len(arts))
+                per = 30 / total
+                panel.step(f"5/6 LLM 설명자 생성 (기사 {len(arts)}개)")
+                router = LLMRouter(
+                    primary_model="gpt-4.1-mini-2025-04-14",
+                    fallback1_model="gemini-2.5-flash",
+                    fallback2_model="gpt-5",
+                )
+                items=[]
+                for c in arts:
+                    cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
+                    core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
+                    items.append((core[:1600], c.meta.get("section_label",""), c.breadcrumbs or []))
+                # 배치 호출이지만, 진행률을 보여주기 위해 한 번에 결과 받아 후처리
+                descs, dlog = router.describe_chunks_batch(items)
+                llm_log["desc"]=dlog
+                for r in dlog.get("routes",[]):
+                    for e in r.get("diag",{}).get("errors",[]): llm_errors.append(f'{e.get("provider")}/{e.get("model")}: {e.get("error")}')
+                j=0
+                for c in chunks:
+                    if c.meta.get("type")!="article": continue
+                    obj = descs[j] if j<len(descs) else None; j+=1
+                    if obj:
+                        c.meta["brief"]=obj.get("brief",""); c.meta["topics"]=obj.get("topics",[]); c.meta["negations"]=obj.get("negations",[])
+                    panel.done_step("LLM 설명자", inc_weight=per)
+                panel.log(f"LLM 설명자 완료 · calls={dlog.get('calls',0)}, ok={dlog.get('ok',0)}, fail={dlog.get('fail',0)}")
+            else:
+                panel.log("LLM 설명자: 비활성화")
+                panel.done_step("LLM 설명자", inc_weight=30)
+
+            st.session_state["llm_errors"] = llm_errors
+
+            # 6) REPORT/RENDER (10)
+            panel.step("6/6 리포트/렌더")
+            cov=_coverage(chunks, len(result.full_text))
+            samples=[]
+            for c in chunks:
+                s,e=int(c.span_start),int(c.span_end)
+                cs,ce = c.meta.get("core_span",[s,e])
+                if isinstance(cs,int) and isinstance(ce,int) and (cs>s or ce<e):
+                    samples.append({
+                        "section": c.meta.get("section_label",""),
+                        "span":[s,e], "core_span":[cs,ce],
+                        "uid": c.meta.get("section_uid","")
+                    })
+                    if len(samples)>=10: break
+
+            report_str = make_debug_report(
+                parse_result=result, chunks=chunks, source_file=src, law_name=final_law or "",
+                run_config={
+                    "strict_lossless":st.session_state["strict_lossless"],
+                    "split_long_articles":st.session_state["split_long_articles"],
+                    "split_threshold_chars":st.session_state["split_threshold_chars"],
+                    "tail_merge_min_chars":st.session_state["tail_merge_min_chars"],
+                    "overlap_chars":st.session_state["overlap_chars"],
+                    "bracket_front_matter":st.session_state["bracket_front_matter"],
+                    "bracket_headnotes":st.session_state["bracket_headnotes"],
+                    "use_llm_law":st.session_state["use_llm_law"],
+                    "use_llm_desc":st.session_state["use_llm_desc"],
+                    "primary_llm_model":"gpt-4.1-mini-2025-04-14"
+                },
+                debug={
+                    "tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**rep_diag},
+                    "make_chunks_diag":{**(mk_diag or {}), "overlap_samples":samples},
+                    "coverage_calc":{"coverage":cov},
+                    "llm":llm_log
+                }
             )
-            items=[]
-            for c in chunks:
-                if c.meta.get("type")!="article": continue
-                cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
-                core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
-                items.append((core[:1600], c.meta.get("section_label",""), c.breadcrumbs or []))
-            descs, dlog = router.describe_chunks_batch(items)
-            llm_log["desc"]=dlog
-            for r in dlog.get("routes",[]):
-                for e in r.get("diag",{}).get("errors",[]): llm_errors.append(f'{e.get("provider")}/{e.get("model")}: {e.get("error")}')
-            j=0
-            for c in chunks:
-                if c.meta.get("type")!="article": continue
-                obj = descs[j] if j<len(descs) else None; j+=1
-                if obj:
-                    c.meta["brief"]=obj.get("brief",""); c.meta["topics"]=obj.get("topics",[]); c.meta["negations"]=obj.get("negations",[])
+            chunks_str = to_jsonl(chunks)
 
-        st.session_state["llm_errors"] = llm_errors
+            st.session_state.update({
+                "parsed":True, "result":result, "chunks":chunks,
+                "doc_type":final_doc_type, "law_name":final_law,
+                "issues":issues_after, "report_json_str":report_str, "chunks_jsonl_str":chunks_str
+            })
 
-        # 4) REPORT
-        cov=_coverage(chunks, len(result.full_text))
-        # 오버랩 샘플
-        samples=[]
-        for c in chunks:
-            s,e=int(c.span_start),int(c.span_end)
-            cs,ce = c.meta.get("core_span",[s,e])
-            if isinstance(cs,int) and isinstance(ce,int) and (cs>s or ce<e):
-                samples.append({
-                    "section": c.meta.get("section_label",""),
-                    "span":[s,e], "core_span":[cs,ce],
-                    "uid": c.meta.get("section_uid","")
-                })
-                if len(samples)>=10: break
+            panel.done_step("리포트/렌더", inc_weight=10)
+            panel.finalize(ok=True)
 
-        report_str = make_debug_report(
-            parse_result=result, chunks=chunks, source_file=src, law_name=final_law or "",
-            run_config={
-                "strict_lossless":st.session_state["strict_lossless"],
-                "split_long_articles":st.session_state["split_long_articles"],
-                "split_threshold_chars":st.session_state["split_threshold_chars"],
-                "tail_merge_min_chars":st.session_state["tail_merge_min_chars"],
-                "overlap_chars":st.session_state["overlap_chars"],
-                "bracket_front_matter":st.session_state["bracket_front_matter"],
-                "bracket_headnotes":st.session_state["bracket_headnotes"],
-                "use_llm_law":st.session_state["use_llm_law"],
-                "use_llm_desc":st.session_state["use_llm_desc"],
-                "primary_llm_model":"gpt-4.1-mini-2025-04-14"
-            },
-            debug={
-                "tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**rep_diag},
-                "make_chunks_diag":{**(mk_diag or {}), "overlap_samples":samples},
-                "coverage_calc":{"coverage":cov},
-                "llm":llm_log
-            }
-        )
-        chunks_str = to_jsonl(chunks)
-
-        st.session_state.update({
-            "parsed":True, "result":result, "chunks":chunks,
-            "doc_type":final_doc_type, "law_name":final_law,
-            "issues":issues_after, "report_json_str":report_str, "chunks_jsonl_str":chunks_str
-        })
+        except Exception as e:
+            panel.log(f"❌ 오류: {type(e).__name__}: {e}")
+            panel.finalize(ok=False)
+            raise
 
     # ---------- 표시/다운로드 ----------
     if st.session_state["parsed"]:
@@ -281,6 +361,7 @@ def main():
         st.markdown('<div class="docwrap">'+html+'</div>', unsafe_allow_html=True)
     else:
         st.info("파일을 올린 뒤 **[파싱]** 버튼을 눌러주세요.")
+        st.caption("사이드바의 ‘진행 상황’ 패널에서 단계별 진행률을 확인할 수 있습니다.")
 
 if __name__ == "__main__":
     main()

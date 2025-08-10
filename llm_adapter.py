@@ -119,6 +119,22 @@ def _validate_json(obj: Dict[str,Any], schema: Dict[str,Any]) -> bool:
     except Exception:
         return False
 
+def _force_json(s: str) -> Optional[Dict[str,Any]]:
+    """best-effort JSON 추출 (선행/후행 텍스트 제거)"""
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    if not isinstance(s, str):
+        return None
+    a = s.find("{"); b = s.rfind("}")
+    if a != -1 and b != -1 and b > a:
+        try:
+            return json.loads(s[a:b+1])
+        except Exception:
+            return None
+    return None
+
 # -------- Router -------- #
 
 class LLMRouter:
@@ -168,26 +184,35 @@ class LLMRouter:
         # openai primary
         for mdl in self._openai_primary_candidates():
             obj, err = self._call_openai_json(mdl, sys, prompt, snippet, 0)
-            if obj and _validate_json(obj, LAW_SCHEMA):
-                _cache_set("openai", mdl, "law", key, obj)
-                diag["route"].append({"provider":"openai","model":mdl,"used":"live"})
-                return obj, diag
+            if obj:
+                if _validate_json(obj, LAW_SCHEMA):
+                    _cache_set("openai", mdl, "law", key, obj)
+                    diag["route"].append({"provider":"openai","model":mdl,"used":"live"})
+                    return obj, diag
+                else:
+                    diag["errors"].append({"provider":"openai","model":mdl,"error":"schema_validation_failed"})
             if err: diag["errors"].append({"provider":"openai","model":mdl,"error":err})
 
         # gemini
         obj, err = self._call_gemini_json(self.fallback1_model, sys, prompt, snippet, 0.0)
-        if obj and _validate_json(obj, LAW_SCHEMA):
-            _cache_set("google", self.fallback1_model, "law", key, obj)
-            diag["route"].append({"provider":"google","model":self.fallback1_model,"used":"live"})
-            return obj, diag
+        if obj:
+            if _validate_json(obj, LAW_SCHEMA):
+                _cache_set("google", self.fallback1_model, "law", key, obj)
+                diag["route"].append({"provider":"google","model":self.fallback1_model,"used":"live"})
+                return obj, diag
+            else:
+                diag["errors"].append({"provider":"google","model":self.fallback1_model,"error":"schema_validation_failed"})
         if err: diag["errors"].append({"provider":"google","model":self.fallback1_model,"error":err})
 
         # gpt-5
         obj, err = self._call_openai_json(self.fallback2_model, sys, prompt, snippet, 0)
-        if obj and _validate_json(obj, LAW_SCHEMA):
-            _cache_set("openai", self.fallback2_model, "law", key, obj)
-            diag["route"].append({"provider":"openai","model":self.fallback2_model,"used":"live"})
-            return obj, diag
+        if obj:
+            if _validate_json(obj, LAW_SCHEMA):
+                _cache_set("openai", self.fallback2_model, "law", key, obj)
+                diag["route"].append({"provider":"openai","model":self.fallback2_model,"used":"live"})
+                return obj, diag
+            else:
+                diag["errors"].append({"provider":"openai","model":self.fallback2_model,"error":"schema_validation_failed"})
         if err: diag["errors"].append({"provider":"openai","model":self.fallback2_model,"error":err})
 
         diag["route"].append({"provider":"all","model":"failed","used":"none"})
@@ -219,26 +244,35 @@ class LLMRouter:
         # openai
         for mdl in self._openai_primary_candidates():
             obj, err = self._call_openai_json(mdl, sys, prompt, snippet, 0.3)
-            if obj and _validate_json(obj, DESC_SCHEMA):
-                _cache_set("openai", mdl, "desc", key, obj)
-                diag["route"].append({"provider":"openai","model":mdl,"used":"live"})
-                return obj, diag
+            if obj:
+                if _validate_json(obj, DESC_SCHEMA):
+                    _cache_set("openai", mdl, "desc", key, obj)
+                    diag["route"].append({"provider":"openai","model":mdl,"used":"live"})
+                    return obj, diag
+                else:
+                    diag["errors"].append({"provider":"openai","model":mdl,"error":"schema_validation_failed"})
             if err: diag["errors"].append({"provider":"openai","model":mdl,"error":err})
 
         # gemini
         obj, err = self._call_gemini_json(self.fallback1_model, sys, prompt, snippet, 0.3)
-        if obj and _validate_json(obj, DESC_SCHEMA):
-            _cache_set("google", self.fallback1_model, "desc", key, obj)
-            diag["route"].append({"provider":"google","model":self.fallback1_model,"used":"live"})
-            return obj, diag
+        if obj:
+            if _validate_json(obj, DESC_SCHEMA):
+                _cache_set("google", self.fallback1_model, "desc", key, obj)
+                diag["route"].append({"provider":"google","model":self.fallback1_model,"used":"live"})
+                return obj, diag
+            else:
+                diag["errors"].append({"provider":"google","model":self.fallback1_model,"error":"schema_validation_failed"})
         if err: diag["errors"].append({"provider":"google","model":self.fallback1_model,"error":err})
 
         # gpt-5
         obj, err = self._call_openai_json(self.fallback2_model, sys, prompt, snippet, 0.3)
-        if obj and _validate_json(obj, DESC_SCHEMA):
-            _cache_set("openai", self.fallback2_model, "desc", key, obj)
-            diag["route"].append({"provider":"openai","model":self.fallback2_model,"used":"live"})
-            return obj, diag
+        if obj:
+            if _validate_json(obj, DESC_SCHEMA):
+                _cache_set("openai", self.fallback2_model, "desc", key, obj)
+                diag["route"].append({"provider":"openai","model":self.fallback2_model,"used":"live"})
+                return obj, diag
+            else:
+                diag["errors"].append({"provider":"openai","model":self.fallback2_model,"error":"schema_validation_failed"})
         if err: diag["errors"].append({"provider":"openai","model":self.fallback2_model,"error":err})
 
         diag["route"].append({"provider":"all","model":"failed","used":"none"})
@@ -260,66 +294,56 @@ class LLMRouter:
 
     def _call_openai_json(self, model, system, prompt, text, temperature):
         """
-        SDK 호환 계층:
-        1) client.responses.create(..., response_format=...) → 실패 시
-        2) client.responses.create(... )                     → 실패 시
-        3) client.chat.completions.create(..., response_format={"type":"json_object"})
+        OpenAI Responses API 전용 호출 (gpt-4.1 / gpt-5 대응)
+        - chat.completions는 gpt-5에 비호환이므로 사용하지 않는다.
+        - max_output_tokens 사용.
         """
         try:
             client = _ensure_openai()
             msg = f"{prompt}\n\n<document>\n{text}\n</document>"
-            # 1) Responses API + response_format
-            try:
-                rf = {"type":"json_schema","json_schema":{"name":"Schema","schema":{"type":"object"},"strict":False}}
-                resp = client.responses.create(
-                    model=model,
-                    input=[{"role":"system","content":system},{"role":"user","content":msg}],
-                    temperature=temperature,
-                    response_format=rf,
-                    max_output_tokens=512,
-                )
-                content = None
-                if hasattr(resp,"output") and resp.output and getattr(resp.output[0],"content",None):
-                    content = resp.output[0].content[0].text
-                if not content and hasattr(resp,"choices"):
-                    content = resp.choices[0].message["content"]
-                if content: return (json.loads(content), None)
-            except TypeError:
-                # 2) Responses API (no response_format)
+
+            # Responses API (권장)
+            resp = client.responses.create(
+                model=model,
+                input=[{"role":"system","content":system},{"role":"user","content":msg}],
+                temperature=temperature,
+                max_output_tokens=512,
+            )
+
+            content = None
+            # 신형 속성
+            if hasattr(resp, "output_text") and resp.output_text:
+                content = resp.output_text
+            # 구형/중간 버전 속성
+            if not content and hasattr(resp, "output") and resp.output:
                 try:
-                    resp = client.responses.create(
-                        model=model,
-                        input=[{"role":"system","content":system},{"role":"user","content":msg}],
-                        temperature=temperature,
-                        max_output_tokens=512,
-                    )
+                    content = resp.output[0].content[0].text
+                except Exception:
                     content = None
-                    if hasattr(resp,"output") and resp.output and getattr(resp.output[0],"content",None):
-                        content = resp.output[0].content[0].text
-                    if not content and hasattr(resp,"choices"):
-                        content = resp.choices[0].message["content"]
-                    if content: return (json.loads(content), None)
-                except Exception as e2:
-                    # 3) Chat Completions JSON 모드
-                    try:
-                        cc = client.chat.completions.create(
-                            model=model,
-                            messages=[{"role":"system","content":system},{"role":"user","content":msg}],
-                            temperature=temperature,
-                            response_format={"type":"json_object"},
-                            max_tokens=512
-                        )
-                        content = cc.choices[0].message.content
-                        if content: return (json.loads(content), None)
-                    except Exception as e3:
-                        return (None, f"{type(e3).__name__}: {str(e3)}"[:180])
-            return (None, "Empty response")
+            # 여전히 없으면 choices 호환
+            if not content and hasattr(resp, "choices"):
+                try:
+                    content = resp.choices[0].message["content"]
+                except Exception:
+                    content = None
+
+            if not content:
+                return (None, "empty_openai_response")
+
+            obj = _force_json(content)
+            if obj is None:
+                return (None, "json_parse_failed")
+            return (obj, None)
+
         except Exception as e:
-            return (None, f"{type(e).__name__}: {str(e)}"[:180])
+            # gpt-5에서 max_tokens 오류 등은 여기로 떨어지면 문자열로 기록
+            return (None, f"{type(e).__name__}: {str(e)}"[:220])
 
     def _call_gemini_json(self, model, system, prompt, text, temperature):
         """
-        Gemini: schema 파라미터 없이 JSON MIME만 요청(버전간 호환).
+        Gemini:
+        - response_mime_type='application/json'
+        - response.text가 비는 경우 candidates[].content.parts[].text에서 수집
         """
         try:
             genai = _ensure_gemini()
@@ -327,6 +351,37 @@ class LLMRouter:
             m = genai.GenerativeModel(model_name=model, system_instruction=system, generation_config=cfg)
             msg = f"{prompt}\n\n<document>\n{text}\n</document>"
             resp = m.generate_content([msg])
-            return (json.loads(resp.text) if getattr(resp,"text",None) else None, None)
+
+            content = None
+            # quick accessor
+            if getattr(resp, "text", None):
+                content = resp.text
+
+            # candidates 파트 순회
+            if not content:
+                try:
+                    for cand in getattr(resp, "candidates", []) or []:
+                        parts = getattr(getattr(cand, "content", None), "parts", None) or []
+                        buf = "".join(getattr(p, "text", "") for p in parts if getattr(p, "text", None))
+                        if buf.strip():
+                            content = buf
+                            break
+                except Exception:
+                    pass
+
+            if not content:
+                # finish_reason 등 힌트가 있으면 에러로 반환
+                fr = None
+                try:
+                    fr = resp.candidates[0].finish_reason  # type: ignore
+                except Exception:
+                    pass
+                return (None, f"gemini_empty_text (finish_reason={fr})")
+
+            obj = _force_json(content)
+            if obj is None:
+                return (None, "json_parse_failed")
+            return (obj, None)
+
         except Exception as e:
-            return (None, f"{type(e).__name__}: {str(e)}"[:180])
+            return (None, f"{type(e).__name__}: {str(e)}"[:220])
