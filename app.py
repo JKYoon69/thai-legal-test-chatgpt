@@ -3,44 +3,19 @@ import time, json
 from typing import List, Dict, Any, Tuple
 import streamlit as st
 
-# ---- 기존 파서/후처리/출력 모듈은 그대로 사용 (repo에 이미 있음) ----
+# 코어 파서 모듈 (이미 repo에 존재)
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import validate_tree, make_chunks, guess_law_name, repair_tree
 from parser_core.schema import ParseResult, Chunk
 from exporters.writers import to_jsonl, make_debug_report
 
-# ---- LLM 어댑터 ----
-from llm_clients import call_openai_41mini, call_openai_gpt5, call_gemini_flash
-from jsonschema import validate as json_validate, ValidationError
+# LLM / 사후구조화
+from llm_clients import call_openai_summary
+from extractors import build_summary_record
 
-APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
+APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)  (No-JSON-Force)"
 
-# ---------- Schemas (LLM 구조적 출력 검증) ----------
-# 스키마를 약간 느슨하게 두고(추후 단계적 강화) schema_validation_failed 빈도를 줄입니다.
-LAW_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "doc_type":   {"type": "string"},  # act|code|regulation|constitution|unknown (모델 프롬프트로 유도)
-        "law_name":   {"type": "string"},
-        "year_be":    {"type": ["string", "null"]},
-        "confidence": {"type": "number"}
-    },
-    "required": ["doc_type", "law_name", "confidence"],
-    "additionalProperties": True
-}
-DESC_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "brief": {"type": "string"},
-        "topics": {"type": "array", "items": {"type": "string"}},
-        "negations": {"type": "array", "items": {"type": "string"}},
-        "confidence": {"type": "number"}
-    },
-    "required": ["brief", "topics", "confidence"],
-    "additionalProperties": True
-}
-
-# ---------- CSS ----------
+# ---------- 스타일 ----------
 def _inject_css():
     st.markdown("""
     <style>
@@ -51,20 +26,21 @@ def _inject_css():
       .chunk-wrap { position:relative; padding:0 12px; border-radius:6px; margin:0 1px; }
       .chunk-wrap::before, .chunk-wrap::after {
         content:"{"; position:absolute; top:-1px; bottom:-1px; width:10px;
-        color:#a3e635; opacity:.90; font-weight:800;
+        color:#b8f55a; opacity:.95; font-weight:800;  /* 연두색 */
       }
       .chunk-wrap::before { left:0; }
       .chunk-wrap::after  { right:0; transform:scaleX(-1); }
-      .overlap { background: rgba(244,114,182,.22); }
-      .overlap-mark { color:#f472b6; font-weight:800; }
-      .close-tail { color:#a3e635; font-weight:800; }
+      .overlap { background: rgba(244,114,182,.22); }  /* 오버랩 영역 (핑크 하이라이트) */
+      .overlap-mark { color:#ec4899; font-weight:800; }
+      .close-tail { color:#b8f55a; font-weight:800; }
       .dlbar { display:flex; gap:10px; align-items:center; margin:.6rem 0 .6rem; flex-wrap:wrap; }
-      .parse-line { margin:.25rem 0 .5rem; }
+      .parse-line { margin:.25rem 0 .6rem; }
       .parse-line button { background:#22c55e !important; color:#fff !important; border:0 !important;
                            padding:.75rem 1.2rem !important; font-weight:800 !important; font-size:16px !important;
                            border-radius:10px !important; width:100%; }
       .badge-warn { display:inline-block; padding:2px 8px; border-radius:8px; background:#fee2e2; color:#b91c1c; font-weight:700; }
       .muted { color:#9ca3af; font-size:12px; }
+      .kv { font-size:12.5px; color:#93c5fd; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -75,8 +51,8 @@ def _ensure_state():
         "strict_lossless":True, "split_long_articles":True,
         "split_threshold_chars":1500, "tail_merge_min_chars":200, "overlap_chars":200,
         "bracket_front_matter":True, "bracket_headnotes":True,
-        "use_llm_law":True, "use_llm_desc":True,
-        "report_json_str":"", "chunks_jsonl_str":"", "llm_errors":[]}
+        "use_llm_summary":True, "llm_errors":[], "report_json_str":"", "chunks_jsonl_str":""
+    }
     for k,v in defaults.items(): st.session_state.setdefault(k,v)
 
 def _coverage(chunks: List[Chunk], total_len: int) -> float:
@@ -91,7 +67,6 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
 def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-# ---------- 원문 렌더 ----------
 def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, include_head=True) -> str:
     N=len(text)
     units=[]
@@ -127,7 +102,7 @@ def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, i
     if cur<N: parts.append(_esc(text[cur:N]))
     return '<div class="doc">'+"".join(parts)+"</div>"
 
-# ---------- 진행상황 패널 ----------
+# ---------- 진행상황 ----------
 class RunPanel:
     def __init__(self):
         with st.sidebar:
@@ -149,71 +124,7 @@ class RunPanel:
         self.status.update(label=f"완료 · {time.time()-self.t0:.1f}s", state=("complete" if ok else "error"))
         self._update("완료", set_to=100)
 
-# ---------- LLM helper ----------
-def _force_json(s: str) -> Dict[str,Any] | None:
-    try: return json.loads(s)
-    except Exception: pass
-    a=s.find("{"); b=s.rfind("}")
-    if a!=-1 and b!=-1 and b>a:
-        try: return json.loads(s[a:b+1])
-        except Exception: return None
-    return None
-
-def _llm_try_models_for_json(prompt: str, schema: Dict[str,Any]) -> Tuple[Dict[str,Any] | None, Dict[str,Any]]:
-    """4.1-mini(스키마 강제) → 실패시 4.1-mini 평문 → Gemini → gpt-5 순으로 시도"""
-    diag={"route":[], "errors":[]}
-
-    # 1) 4.1-mini + schema
-    r = call_openai_41mini(prompt, schema={"name":"schema", "schema":schema})
-    if r.get("ok"):
-        obj = _force_json(r["text"])
-        if obj:
-            try: json_validate(obj, schema); diag["route"].append({"m":"4.1-mini:structured"}); return obj, diag
-            except ValidationError: diag["errors"].append({"m":"4.1-mini:structured","e":"schema_validation_failed"})
-        else:
-            diag["errors"].append({"m":"4.1-mini:structured","e":"json_parse_failed"})
-    else:
-        diag["errors"].append({"m":"4.1-mini:structured","e":r.get("error")})
-
-    # 2) 4.1-mini 평문
-    r = call_openai_41mini(prompt, schema=None)
-    if r.get("ok"):
-        obj=_force_json(r["text"])
-        if obj:
-            try: json_validate(obj, schema); diag["route"].append({"m":"4.1-mini:plain"}); return obj, diag
-            except ValidationError: diag["errors"].append({"m":"4.1-mini:plain","e":"schema_validation_failed"})
-        else:
-            diag["errors"].append({"m":"4.1-mini:plain","e":"json_parse_failed"})
-    else:
-        diag["errors"].append({"m":"4.1-mini:plain","e":r.get("error")})
-
-    # 3) Gemini
-    r = call_gemini_flash(prompt)
-    if r.get("ok"):
-        obj=_force_json(r["text"])
-        if obj:
-            try: json_validate(obj, schema); diag["route"].append({"m":"gemini"}); return obj, diag
-            except ValidationError: diag["errors"].append({"m":"gemini","e":"schema_validation_failed"})
-        else:
-            diag["errors"].append({"m":"gemini","e":"json_parse_failed"})
-    else:
-        diag["errors"].append({"m":"gemini","e":r.get("error")})
-
-    # 4) gpt-5 (temperature 미전달)
-    r = call_openai_gpt5(prompt)
-    if r.get("ok"):
-        obj=_force_json(r["text"])
-        if obj:
-            try: json_validate(obj, schema); diag["route"].append({"m":"gpt-5"}); return obj, diag
-            except ValidationError: diag["errors"].append({"m":"gpt-5","e":"schema_validation_failed"})
-        else:
-            diag["errors"].append({"m":"gpt-5","e":"json_parse_failed"})
-    else:
-        diag["errors"].append({"m":"gpt-5","e":r.get("error")})
-
-    return None, diag
-
-# ---------- Main ----------
+# ---------- 메인 ----------
 def main():
     _inject_css(); _ensure_state()
     st.title(APP_TITLE)
@@ -223,6 +134,7 @@ def main():
         st.markdown('<div class="parse-line">', unsafe_allow_html=True)
         run = st.button("파싱", key="parse_btn_top"); st.markdown('</div>', unsafe_allow_html=True)
 
+    # 옵션 한 줄 배치
     c1,c2,c3=st.columns(3)
     with c1: st.session_state["split_threshold_chars"]=st.number_input("분할 임계값(문자)",600,6000,st.session_state["split_threshold_chars"],100)
     with c2: st.session_state["tail_merge_min_chars"]=st.number_input("tail 병합 최소 길이(문자)",0,600,st.session_state["tail_merge_min_chars"],10)
@@ -235,9 +147,7 @@ def main():
         st.session_state["bracket_front_matter"]=st.checkbox("Front matter도 표시", value=st.session_state["bracket_front_matter"])
         st.session_state["bracket_headnotes"]=st.checkbox("Headnote(ส่วน/หมวด 등) 표시", value=st.session_state["bracket_headnotes"])
 
-    l1,l2=st.columns(2)
-    with l1: st.session_state["use_llm_law"]=st.checkbox("LLM: 법령명/유형 보정", value=st.session_state["use_llm_law"])
-    with l2: st.session_state["use_llm_desc"]=st.checkbox("LLM: 설명자 생성", value=st.session_state["use_llm_desc"])
+    st.session_state["use_llm_summary"]=st.checkbox("LLM 요약 생성(프리포맷 → 사후 구조화)", value=st.session_state["use_llm_summary"])
 
     if up is not None:
         try:
@@ -255,8 +165,8 @@ def main():
         try:
             text = st.session_state["text"]; src = st.session_state["source_file"]
 
-            # 1) parse
-            panel.step("1/6 파싱 시작")
+            # 1) 파싱
+            panel.step("1/5 파싱 시작")
             t0 = time.time()
             doc_type = detect_doc_type(text)
             result: ParseResult = parse_document(text, doc_type=doc_type)
@@ -264,16 +174,16 @@ def main():
             panel.tick("파싱", inc=20)
 
             # 2) 수복/검증
-            panel.step("2/6 트리 수복/검증")
+            panel.step("2/5 트리 수복/검증")
             t0 = time.time()
             issues_before = validate_tree(result)
             rep_diag = repair_tree(result)
             issues_after = validate_tree(result)
             panel.log(f"수복 전 이슈={len(issues_before)} → 후={len(issues_after)} · {time.time()-t0:.2f}s")
-            panel.tick("트리 수복", inc=10)
+            panel.tick("트리 수복", inc=15)
 
             # 3) 청킹
-            panel.step("3/6 청킹")
+            panel.step("3/5 청킹")
             t0 = time.time()
             base_law = guess_law_name(text)
             chunks, mk_diag = make_chunks(
@@ -290,86 +200,54 @@ def main():
             panel.log(f"청크 {len(chunks)}개 생성 · {time.time()-t0:.2f}s")
             panel.tick("청킹", inc=20)
 
-            # 4) LLM 메타 (법령명/유형)
-            final_doc_type = result.doc_type or "unknown"
-            final_law = base_law or ""
+            # 4) LLM 요약 + 사후 구조화
             llm_errors: List[str] = []
-            llm_log={"law":{}, "desc":{}}
-
-            if st.session_state["use_llm_law"]:
-                panel.step("4/6 LLM 메타(법령명/유형)")
-                prompt = (
-                    "คุณคือผู้ช่วย metadata สำหรับเอกสารกฎหมาย สกัดหัวเรื่อง/ประเภท แล้วส่งออก JSON ตามสคีมา:\n"
-                    "- doc_type: act|code|regulation|constitution|unknown\n"
-                    "- law_name: ชื่อกฎหมายแบบสั้นแต่ครบ\n"
-                    "- year_be: พ.ศ. ถ้ามี ไม่พบให้ null\n"
-                    "- confidence: 0..1\n"
-                    "ห้ามคาดเดาเกินเนื้อหา ตอบ JSON เท่านั้น\n\n"
-                    f"<document>\n{text[:1600]}\n</document>"
-                )
-                obj, diag = _llm_try_models_for_json(prompt, LAW_SCHEMA)
-                llm_log["law"]=diag
-                if obj:
-                    final_doc_type = obj.get("doc_type") or final_doc_type
-                    final_law = obj.get("law_name") or final_law
-                else:
-                    llm_errors += [f'law:{e.get("m")}:{e.get("e")}' for e in diag.get("errors",[])]
-                panel.log("LLM 메타 완료")
-            else:
-                panel.log("LLM 메타: 비활성화")
-            panel.tick("LLM 메타", inc=10)
-
-            # 5) LLM 설명자 (조문 요약/주제어)
-            if st.session_state["use_llm_desc"]:
+            if st.session_state["use_llm_summary"]:
+                panel.step("4/5 LLM 요약 생성")
                 arts = [c for c in chunks if c.meta.get("type")=="article"]
                 total = max(1, len(arts))
                 per = 30 / total
-                panel.step(f"5/6 LLM 설명자 생성 (기사 {len(arts)}개)")
                 for c in arts:
                     cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
                     core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
                     prompt = (
-                        "สรุปเจตนารมณ์ของข้อความกฎหมายแบบย่อ แล้วส่งออก JSON:\n"
-                        "- brief ≤ 180 (ห้ามใส่เลขมาตรา/ข้อ)\n"
-                        "- topics 3–6\n"
-                        "- negations (ไม่/ห้าม/เว้นแต่) 0–4 ถ้ามี\n"
-                        "ห้ามคาดเดาเกินเนื้อหา\n\n"
+                        "สรุปใจความสำคัญของข้อความด้านล่างแบบสั้น กระชับ เป็นข้อ ๆ (3–6 ข้อ) "
+                        "ห้ามขึ้นหัวเรื่อง ห้ามใส่อ้างอิง/เชิงอรรถ/เลขเชิงอรรถ และห้ามใช้ Markdown heading:\n\n"
                         f"<section>{c.meta.get('section_label','')}</section>\n"
                         f"<breadcrumbs>{' / '.join(c.breadcrumbs or [])}</breadcrumbs>\n"
                         f"<document>\n{core[:1600]}\n</document>"
                     )
-                    obj, d = _llm_try_models_for_json(prompt, DESC_SCHEMA)
-                    if obj:
-                        c.meta["brief"]=obj.get("brief","")
-                        c.meta["topics"]=obj.get("topics",[])
-                        c.meta["negations"]=obj.get("negations",[])
+                    r = call_openai_summary(prompt, max_tokens=420, temperature=0.2)
+                    if r.get("ok"):
+                        rec = build_summary_record(
+                            law_name=base_law or "",
+                            section_label=c.meta.get("section_label",""),
+                            breadcrumbs=c.breadcrumbs or [],
+                            span=(c.span_start, c.span_end),
+                            llm_text=r["text"],
+                            brief_max_len=180
+                        )
+                        # 결과를 chunk 메타에 저장(원문 요약 포함)
+                        c.meta["brief"]=rec["brief"]
+                        c.meta["topics"]=rec["topics"]
+                        c.meta["negations"]=rec["negations"]
+                        c.meta["summary_text_raw"]=rec["summary_text_raw"]
+                        c.meta["quality"]=rec["quality"]
                     else:
-                        llm_errors += [f'desc:{e.get("m")}:{e.get("e")}' for e in d.get("errors",[])]
-                    panel.tick("LLM 설명자", inc=per)
-                llm_log["desc"]={"errors":llm_errors}
+                        llm_errors.append(f"{c.meta.get('section_label','?')}: {r.get('error')}")
+                    panel.tick("LLM 요약", inc=per)
             else:
-                panel.log("LLM 설명자: 비활성화")
-                panel.tick("LLM 설명자", inc=30)
+                panel.log("LLM 요약: 비활성화")
+                panel.tick("LLM 요약", inc=30)
 
             st.session_state["llm_errors"] = llm_errors
 
-            # 6) REPORT/RENDER
-            panel.step("6/6 리포트/렌더")
+            # 5) REPORT/RENDER
+            panel.step("5/5 리포트/렌더")
             cov=_coverage(chunks, len(result.full_text))
-            samples=[]
-            for c in chunks:
-                s,e=int(c.span_start),int(c.span_end)
-                cs,ce = c.meta.get("core_span",[s,e])
-                if isinstance(cs,int) and isinstance(ce,int) and (cs>s or ce<e):
-                    samples.append({
-                        "section": c.meta.get("section_label",""),
-                        "span":[s,e], "core_span":[cs,ce],
-                        "uid": c.meta.get("section_uid","")
-                    })
-                    if len(samples)>=10: break
 
             report_str = make_debug_report(
-                parse_result=result, chunks=chunks, source_file=src, law_name=final_law or "",
+                parse_result=result, chunks=chunks, source_file=src, law_name=base_law or "",
                 run_config={
                     "strict_lossless":st.session_state["strict_lossless"],
                     "split_long_articles":st.session_state["split_long_articles"],
@@ -378,26 +256,23 @@ def main():
                     "overlap_chars":st.session_state["overlap_chars"],
                     "bracket_front_matter":st.session_state["bracket_front_matter"],
                     "bracket_headnotes":st.session_state["bracket_headnotes"],
-                    "use_llm_law":st.session_state["use_llm_law"],
-                    "use_llm_desc":st.session_state["use_llm_desc"],
-                    "primary_llm_model":"gpt-4.1-mini-2025-04-14"
+                    "use_llm_summary":st.session_state["use_llm_summary"],
+                    "llm_model":"gpt-4.1-mini-2025-04-14"
                 },
                 debug={
-                    "tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**rep_diag},
-                    "make_chunks_diag":{**(mk_diag or {}), "overlap_samples":samples},
+                    "tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**(rep_diag or {})},
+                    "make_chunks_diag":mk_diag or {},
                     "coverage_calc":{"coverage":cov},
-                    "llm":llm_log
+                    "llm":{"errors":llm_errors}
                 }
             )
             chunks_str = to_jsonl(chunks)
 
             st.session_state.update({
                 "parsed":True, "result":result, "chunks":chunks,
-                "doc_type":final_doc_type, "law_name":final_law,
+                "doc_type":result.doc_type or "unknown", "law_name":base_law or "",
                 "issues":issues_after, "report_json_str":report_str, "chunks_jsonl_str":chunks_str
             })
-
-            panel.tick("리포트/렌더", inc=10)
             panel.finalize(ok=True)
 
         except Exception as e:
