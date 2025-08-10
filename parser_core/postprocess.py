@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-postprocess.py
-- 파서 결과(ParseResult)를 받아 조문 단위 청크를 생성/보정
+postprocess.py  (self-contained, app.py와 호환되는 경량 청크 반환)
+- 파서 결과(ParseResult)에서 조문 단위 청크 생성/보정
 - 옵션:
-  * strict_lossless: 커버리지 1.0을 목표로 gap-sweeper 가동
+  * strict_lossless: 커버리지 1.0 목표 gap-sweeper
   * split_long_articles: 롱 조문 분할(문장 경계 우선, 실패 시 soft cut)
-  * tail_merge_min_chars: 분할 마지막 조각이 너무 짧으면 앞 파트로 흡수
+  * tail_merge_min_chars: 분할 마지막 자투리(≤임계) 앞 파트로 흡수
   * overlap_chars: 분할 시 앞/뒤 오버랩(문맥)
   * include_front_matter / include_headnotes / include_gap_fallback
 - 공개 함수:
@@ -17,10 +17,21 @@ import re
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
 
-# ---------------------------------------------------------------------------
-# 외부 스키마와 느슨하게 결합하기 위한 유틸
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 경량 Chunk (app.py / exporters에서 기대하는 속성들만 제공)
+# -----------------------------------------------------------------------------
+@dataclass
+class Chunk:
+    text: str
+    span_start: int
+    span_end: int
+    meta: Dict[str, Any]
+    breadcrumbs: List[str]
 
+
+# -----------------------------------------------------------------------------
+# 내부 유틸
+# -----------------------------------------------------------------------------
 def _get_full_text(result) -> str:
     """ParseResult로부터 본문 텍스트를 안전하게 얻는다."""
     try:
@@ -28,45 +39,37 @@ def _get_full_text(result) -> str:
             return result.full_text
     except Exception:
         pass
-    # 안전 폴백
     return getattr(result, "text", "") or ""
 
-def _make_chunk_class():
-    """외부 Chunk 클래스를 import 못하는 환경에서도 동작하도록 폴백 정의."""
-    try:
-        from .schema import Chunk  # type: ignore
-        return Chunk
-    except Exception:
-        @dataclass
-        class _Chunk:
-            text: str
-            span_start: int
-            span_end: int
-            meta: Dict[str, Any]
-            breadcrumbs: List[str]
-        return _Chunk
 
-Chunk = _make_chunk_class()
+def _safe_slice(s: str, a: int, b: int) -> str:
+    a = max(0, min(len(s), int(a)))
+    b = max(0, min(len(s), int(b)))
+    if b <= a:
+        return ""
+    return s[a:b]
 
-# ────────────────────────────────────────────────────────────────────────────
-# 1) 유틸: 숫자/라벨 판정
-# ────────────────────────────────────────────────────────────────────────────
 
+def _mk_uid(label: str, start: int) -> str:
+    return f"{label}|{start}"
+
+
+# -----------------------------------------------------------------------------
+# 라벨/패턴
+# -----------------------------------------------------------------------------
 THAI_DIGITS = "๐๑๒๓๔๕๖๗๘๙"
+
 ARTICLE_PAT = re.compile(r"(มาตรา)\s*([0-9" + THAI_DIGITS + r"]+)")
-# 헤드노트(라인 단위로 잡음)
 HEAD_PAT = re.compile(
     r"(?m)^(?P<label>\s*(ภาค|ลักษณะ|หมวด|ส่วน|บท(?:บัญญัติทั่วไป)?)[^\n]{0,80})\s*$"
 )
 
-# 문장/절 경계 후보 문자
 CANDIDATE_BREAK = re.compile(r"[.!?;:]\s|\n{1,3}|[”\"'’)]\s|ฯ")
-
 PART_RE = re.compile(r"^(?P<base>.+?)\s*\(part\s*(?P<idx>\d+)\)\s*$", re.IGNORECASE)
 
 
 def _part_info(label: str) -> Tuple[str, Optional[int]]:
-    """ 'มาตรา 119 (part 2)' -> ('มาตรา 119', 2) / 'มาตรา 119' -> ('มาตรา 119', None) """
+    """'มาตรา 119 (part 2)' -> ('มาตรา 119', 2) / 'มาตรา 119' -> ('มาตรา 119', None)"""
     if not isinstance(label, str):
         return ("", None)
     m = PART_RE.match(label.strip())
@@ -78,54 +81,37 @@ def _part_info(label: str) -> Tuple[str, Optional[int]]:
         return (label.strip(), None)
 
 
-def _mk_uid(label: str, start: int) -> str:
-    return f"{label}|{start}"
-
-
-def _safe_slice(s: str, a: int, b: int) -> str:
-    a = max(0, min(len(s), int(a)))
-    b = max(0, min(len(s), int(b)))
-    if b <= a:
-        return ""
-    return s[a:b]
-
-
-# ────────────────────────────────────────────────────────────────────────────
-# 2) validate / repair / guess
-# ────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# validate / repair / guess
+# -----------------------------------------------------------------------------
 def validate_tree(result) -> List[str]:
     """
-    트리 진단: 최소한의 점검만 수행.
-    - full_text가 비어있지 않은가?
-    - (간단 점검) 'มาตรา'가 존재하는가?
+    간단 진단:
+    - full_text 비어있는지
+    - 'มาตรา' 존재하는지
     """
     issues: List[str] = []
     text = _get_full_text(result)
     if not text:
         issues.append("empty_full_text")
         return issues
-
     if not ARTICLE_PAT.search(text):
         issues.append("no_article_pattern_found")
-
-    # 필요 시 추가 진단 가능
     return issues
 
 
 def repair_tree(result) -> Dict[str, Any]:
     """
-    구조 수복(라이트 버전). 실제 파서 트리 대신 텍스트 기반으로 보정 포인트만 리턴.
-    여기서는 별도 수정을 하지 않고, 디버그 표식만 반환.
+    구조 수복(라이트). 텍스트 기반으로 보정 포인트만 리턴.
+    실제 트리 재배열은 추후 확장 가능.
     """
-    # 향후: 잘못된 헤드노트 레벨/순서를 재배치하는 로직을 여기에 추가 가능
     return {"repaired": False, "note": "text-only light repair; no structural changes"}
 
 
 def guess_law_name(text: str) -> str:
     """
-    법령명 추정(간단 휴리스틱):
-    - 첫 5~8줄에서 'พระราชบัญญัติ', 'ประมวลกฎหมาย', 'รัฐธรรมนูญ' 등의 키워드 라인을 찾음
+    법령명 추정(휴리스틱):
+    - 첫 10~12줄에서 'พระราชบัญญัติ', 'ประมวลกฎหมาย', 'รัฐธรรมนูญ' 등 키워드 라인 추출
     """
     if not text:
         return ""
@@ -135,21 +121,18 @@ def guess_law_name(text: str) -> str:
         if not line_strip:
             continue
         if any(k in line_strip for k in ("พระราชบัญญัติ", "ประมวลกฎหมาย", "รัฐธรรมนูญ", "พระราชกำหนด", "ประกาศ")):
-            # 길이가 너무 짧으면 다음 라인과 합체
             if len(line_strip) < 12:
                 continue
             return line_strip
-    # 못 찾으면 첫 비어있지 않은 줄
     for line in first_block.splitlines():
         if line.strip():
             return line.strip()
     return ""
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# 3) 청크 생성
-# ────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# 스캔/세그먼트
+# -----------------------------------------------------------------------------
 def _scan_markers(text: str) -> Tuple[List[Tuple[int, int, str]], List[Tuple[int, int, str]]]:
     """
     텍스트에서 헤드노트/조문 시작 위치를 스캔.
@@ -163,7 +146,6 @@ def _scan_markers(text: str) -> Tuple[List[Tuple[int, int, str]], List[Tuple[int
     for m in HEAD_PAT.finditer(text):
         s, e = m.span()
         label = m.group("label").strip()
-        # 라벨은 너무 긴 라인을 제외 (이상치 필터)
         if 1 <= len(label) <= 120:
             heads.append((s, e, label))
 
@@ -182,7 +164,6 @@ def _collect_segments(text: str, heads, arts) -> List[Dict[str, Any]]:
     head/article 시작점 기준으로 다음 시작점 직전까지를 segment로 본다.
     각 segment: {"type": "headnote"|"article", "label": str, "span": (s,e), "head_ctx": [...breadcrumbs...]}
     """
-    # merge 시작점
     points = []
     for s, e, lab in heads:
         points.append((s, "headnote", (s, e, lab)))
@@ -199,21 +180,19 @@ def _collect_segments(text: str, heads, arts) -> List[Dict[str, Any]]:
         end_of_this = points[i + 1][0] if i + 1 < len(points) else len(text)
 
         if typ == "headnote":
-            # 헤드노트를 만나면 breadcrumbs 갱신
             breadcrumbs.append(label)
             segs.append({"type": "headnote", "label": label, "span": (start_of_this, end_of_this), "head_ctx": list(breadcrumbs)})
         else:
-            # article: 현재까지의 breadcrumbs를 부여
             segs.append({"type": "article", "label": label, "span": (start_of_this, end_of_this), "head_ctx": list(breadcrumbs)})
 
     return segs
 
 
+# -----------------------------------------------------------------------------
+# 롱 조문 분할
+# -----------------------------------------------------------------------------
 def _best_cut(text: str, near: int, left: int, right: int) -> int:
-    """
-    [left, right] 구간에서 near에 가까운 문장 경계 후보 위치를 찾는다.
-    실패 시 near 반환.
-    """
+    """[left, right] 내에서 near에 가까운 문장 경계 후보를 찾는다. 실패 시 near 반환."""
     if left >= right:
         return near
     window = text[left:right]
@@ -243,20 +222,16 @@ def _split_article(text: str, s: int, e: int, label: str, overlap: int, limit: i
     idx = 1
     while cursor < e:
         target = min(cursor + limit, e)
-        # 경계 찾기
         cut = _best_cut(text, target, cursor + int(limit * 0.6), min(e, cursor + int(limit * 1.4))) if soft_cut else target
         cut = max(cursor + 1, min(cut, e))
         span_s = cursor
         span_e = cut
 
-        # 오버랩 적용
         core_s = span_s
         core_e = span_e
         if overlap > 0:
-            # 앞 파트의 꼬리와 다음 파트의 머리를 서로 겹치게
-            if parts:  # 이전 파트 존재
+            if parts:
                 core_s = span_s + min(overlap, (span_e - span_s) // 3)
-            # 다음 파트가 있다면
             if span_e < e:
                 core_e = span_e - min(overlap, (span_e - span_s) // 3)
 
@@ -269,13 +244,15 @@ def _split_article(text: str, s: int, e: int, label: str, overlap: int, limit: i
         last_label, (ls, le), (lcs, lce) = parts[-1]
         prev_label, (ps, pe), (pcs, pce) = parts[-2]
         if (le - ls) <= tail_merge_min_chars:
-            # 앞 파트로 흡수
             parts[-2] = (prev_label, (ps, le), (pcs, le))
             parts.pop(-1)
 
     return parts
 
 
+# -----------------------------------------------------------------------------
+# 청크 생성
+# -----------------------------------------------------------------------------
 def make_chunks(
     *,
     result,
@@ -296,7 +273,7 @@ def make_chunks(
     soft_cut: bool = True,
 ) -> Tuple[List[Chunk], Dict[str, Any]]:
     """
-    텍스트 기반 조문 청킹(라이트). 파서 트리가 풍부해도 full_text만으로 동작.
+    텍스트 기반 조문 청킹(라이트). 파서 트리가 없어도 full_text만으로 동작.
     반환: (chunks, diagnostics)
     """
     text = _get_full_text(result)
@@ -415,7 +392,6 @@ def make_chunks(
         for ch in chunks:
             s, e = int(ch.span_start), int(ch.span_end)
             if s > cur and (s - cur) >= min_gap_len:
-                # gap
                 gf = Chunk(
                     text=_safe_slice(text, cur, s),
                     span_start=cur, span_end=s,
@@ -456,10 +432,9 @@ def make_chunks(
     return (chunks, diag)
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# 4) tail-sweep: 마지막 짧은 파트는 앞 파트로 병합
-# ────────────────────────────────────────────────────────────────────────────
-
+# -----------------------------------------------------------------------------
+# tail-sweep: 마지막 짧은 파트는 앞 파트로 병합
+# -----------------------------------------------------------------------------
 def merge_small_trailing_parts(
     chunks: List[Chunk],
     *,
@@ -468,14 +443,13 @@ def merge_small_trailing_parts(
 ) -> Dict[str, Any]:
     """
     분할 시리즈의 마지막(part N) 조각이 너무 짧으면 앞 조각으로 흡수.
-    - 같은 시리즈(base)가 맞고, 현재가 연속(part n, part n+1)이며
-    - 뒤 파트 길이<=max_tail_chars
-    - prev.meta/core_span[1], span_end를 curr의 끝까지 확장하고 curr 제거
+    - 같은 시리즈(base) 연속(part n → n+1)
+    - 뒤 파트 길이 ≤ max_tail_chars
+    - prev.meta.core_span[1], prev.span_end를 curr 끝까지 확장, curr 제거
     """
     if not chunks:
         return {"merged_count": 0, "affected_sections": []}
 
-    # span 정렬이 전제
     chunks.sort(key=lambda c: (int(c.span_start), int(c.span_end)))
 
     merged = 0
@@ -504,7 +478,6 @@ def merge_small_trailing_parts(
                 # core_span 보정
                 prev_core = prev.meta.get("core_span", [prev.span_start, prev.span_end])
                 curr_core = curr.meta.get("core_span", [curr.span_start, curr.span_end])
-
                 try:
                     prev.meta["core_span"] = [int(prev_core[0]), int(curr_core[1])]
                 except Exception:
