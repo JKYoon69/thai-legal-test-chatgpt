@@ -91,14 +91,12 @@ def _thai_to_arabic(s: str) -> str:
     return s.translate(_THAI_DIGITS)
 
 def _is_promulgation_line(ln: str) -> bool:
-    # 공포문/날짜 라인 패턴 (law_name에는 제외)
     keys = [
         "ให้ไว้ ณ", "ให้ไว้  ณ", "ให้ไว้ ณ วันที่",
         "ประกาศ ณ", "ในพระปรมาภิไธย", "ราชกิจจานุเบกษา"
     ]
     if any(k in ln for k in keys):
         return True
-    # "วันที่ ... (Thai month) พ.ศ." 형태를 포함하되, 단독 'พ.ศ.'만 있는 연도 라인은 제외
     if "วันที่" in ln and any(m in ln for m in THAI_MONTHS):
         return True
     return False
@@ -138,15 +136,12 @@ def guess_law_name(text: str) -> Optional[str]:
         if any(k in ln for k in ("ภาค", "ลักษณะ", "หมวด", "ส่วน", "บท", "มาตรา")):
             break
         if _is_promulgation_line(ln):
-            # 공포문 라인은 title 구성에서 제외
             continue
-        # 부제 후보
         if ("ให้ใช้" in ln) or ("ยาเสพติด" in ln) or ("ประมวลกฎหมาย" in ln):
             if len(ln) > len(subline):
                 subline = ln
         if not subline:
             subline = ln
-        # 연도 추출
         yp = _extract_year_phrase(ln)
         if yp:
             year_phrase = yp
@@ -172,7 +167,6 @@ def validate_tree(result: ParseResult) -> List[str]:
                 nxt = n.children[i + 1]
                 if c.span_end > nxt.span_start:
                     issues.append(f"Span overlap at {c.label} {c.num} -> {nxt.label} {nxt.num}")
-            # child outside parent
             if c.span_start < n.span_start or c.span_end > n.span_end:
                 issues.append(f"child outside parent: {c.label} {c.num} in {n.label} {n.num}")
             _check(c)
@@ -208,7 +202,6 @@ def repair_tree(result: ParseResult) -> Dict[str, Any]:
         if n.level > max_depth:
             max_depth = n.level
 
-    # 1) 부모 span 보정
     for depth in range(max_depth - 1, -1, -1):
         for p in nodes_by_depth.get(depth, []):
             if not p.children:
@@ -242,7 +235,6 @@ def repair_tree(result: ParseResult) -> Dict[str, Any]:
                 p.text = full[p.span_start:p.span_end]
                 diag["adjusted_parents"] += 1
 
-    # 2) 여전히 부모 밖에 있는 자식은 최소 reparent(root)
     root = result.root
     for p in result.all_nodes:
         for c in list(p.children):
@@ -321,13 +313,16 @@ def make_chunks(
     split_long_articles: bool = False,
     split_threshold_chars: int = 1800,
     tail_merge_min_chars: int = 200,
+    # NEW: 문맥 오버랩 + 소프트 컷
+    overlap_chars: int = 200,
+    soft_cut: bool = True,
 ) -> Tuple[List[Chunk], Dict[str, Any]]:
     """
     Strict:
       - headnote/gap 길이 필터 비활성
-      - post-fill로 남은 간극 orphan_gap 보강(공백-only 포함)
-    + 회계(diag) 세분화
-    + 롱 조문 분할 + tail 병합(마지막 part가 기준 미만이면 앞 파트와 병합)
+      - post-fill로 남은 간극 orphan_gap 보강
+    + 롱 조문 분할 + tail 병합
+    + (NEW) 파트 간 오버랩(문맥) 부여, 컷 위치 휴리스틱
     """
     text = result.full_text
     total_len = len(text)
@@ -355,22 +350,63 @@ def make_chunks(
             "merged_count": 0,
             "affected_sections": [],
         },
+        "overlap": {
+            "enabled": overlap_chars > 0,
+            "overlap_chars": int(overlap_chars),
+            "example_core_vs_expanded": [],
+        },
     }
 
     # 1) article leaves
     leaves = _collect_article_leaves(result.root)
     series_map = _article_series_index(leaves)
 
+    # 컷 휴리스틱
+    _re_list_item = re.compile(r"(?m)^\s*(?:[\(\[]?\s*[0-9๑-๙]+[\)\.]|[-•])\s+")
+    _re_soft_punct = re.compile(r"[;:ฯ]")
+
+    def _pick_soft_cut(p: int, e: int, q_target: int) -> int:
+        """
+        soft_cut: \n\n > 주변 \n(±120) > 근처 구두점/두 칸 공백 > fallback
+        """
+        window = min(120, e - p)
+        # 1) 단락 경계
+        cut = text.rfind("\n\n", p + int(0.6 * (q_target - p)), min(q_target + window, e))
+        if cut != -1 and cut - p >= 200:
+            return cut
+        # 2) 근처 줄바꿈
+        left = text.rfind("\n", max(p, q_target - window), q_target + 1)
+        right = text.find("\n", q_target, min(e, q_target + window))
+        cand = -1
+        if right != -1:
+            cand = right
+        if left != -1 and (cand == -1 or (q_target - left) <= (cand - q_target)):
+            cand = left
+        if cand != -1 and cand - p >= 200:
+            return cand
+        # 3) 구두점/두 칸 공백
+        back = text.rfind("  ", max(p, q_target - 200), q_target + 1)
+        if back != -1 and back - p >= 150:
+            return back
+        m = None
+        for m_ in _re_soft_punct.finditer(text, max(p, q_target - 200), min(e, q_target + 1)):
+            m = m_
+        if m and (m.end() - p) >= 150:
+            return m.end()
+        # 4) 백업
+        return q_target
+
     def _split_paragraph_smart(s: int, e: int) -> List[Tuple[int, int]]:
+        """핵심(core) 스팬 리스트 반환"""
         if not split_long_articles or (e - s) <= split_threshold_chars:
             return [(s, e)]
         spans: List[Tuple[int, int]] = []
         p = s
         while p < e:
-            q = min(p + split_threshold_chars, e)
-            cut = text.rfind("\n\n", p + int(0.6 * split_threshold_chars), q)
-            if cut == -1 or cut <= p + 200:
-                cut = q
+            q_target = min(p + split_threshold_chars, e)
+            cut = _pick_soft_cut(p, e, q_target) if soft_cut else q_target
+            if cut <= p:
+                cut = min(p + split_threshold_chars, e)
             spans.append((p, cut))
             p = cut
         return spans
@@ -395,12 +431,21 @@ def make_chunks(
         crumbs = _breadcrumbs(leaf, result)
         section_uid = "/".join(crumbs) if crumbs else section_label
 
-        spans = _split_paragraph_smart(leaf.span_start, leaf.span_end)
-        spans = _apply_tail_merge(spans, section_uid)
-        series_total = len(spans)
+        core_spans = _split_paragraph_smart(leaf.span_start, leaf.span_end)
+        core_spans = _apply_tail_merge(core_spans, section_uid)
+        series_total = len(core_spans)
         diag["split"]["series_total_counts"][str(series_total)] = diag["split"]["series_total_counts"].get(str(series_total), 0) + 1
 
-        for k, (s, e) in enumerate(spans, 1):
+        prev_exp_end = None
+        for k, (cs, ce) in enumerate(core_spans, 1):
+            # 오버랩 확장
+            s = max(leaf.span_start, cs - max(0, overlap_chars))
+            e = min(leaf.span_end, ce + max(0, overlap_chars))
+            if prev_exp_end is not None and s < prev_exp_end:
+                s = prev_exp_end  # 앞 파트와 겹치면 앞의 끝에 맞춤
+            if e <= s:
+                continue
+
             label = section_label + (f" (part {k})" if series_total > 1 else "")
             meta = {
                 "type": "article",
@@ -415,6 +460,9 @@ def make_chunks(
                 "retrieval_weight": str(_retrieval_weight_for("article")),
                 "series_index": str(k),
                 "series_total": str(series_total),
+                # NEW
+                "core_span": [int(cs), int(ce)],
+                "overlap_chars": str(overlap_chars),
             }
             chunks.append(
                 Chunk(
@@ -426,6 +474,13 @@ def make_chunks(
                     meta=meta,
                 )
             )
+            prev_exp_end = e
+
+            # 진단 예시 3건만 수집
+            if len(diag["overlap"]["example_core_vs_expanded"]) < 3:
+                diag["overlap"]["example_core_vs_expanded"].append(
+                    {"core": [int(cs), int(ce)], "expanded": [int(s), int(e)], "section_uid": section_uid}
+                )
 
     # 2) front_matter
     if include_front_matter:
@@ -458,7 +513,7 @@ def make_chunks(
                     )
                 break
 
-    # 3) headnotes (레벨+이명 허용 / Strict면 길이 필터 해제)
+    # 3) headnotes (Strict면 길이 필터 해제)
     if include_headnotes:
         allowed = set(allowed_headnote_levels)
 
@@ -564,7 +619,7 @@ def make_chunks(
         if s is None or e is None or e <= s:
             diag["removals"]["removed_invalid_span"] += 1
             continue
-        c.text = text[s:e]  # 원문 재동기화
+        c.text = text[s:e]
         if not strict_lossless and c.text.strip() == "":
             diag["removals"]["removed_empty_text"] += 1
             continue
