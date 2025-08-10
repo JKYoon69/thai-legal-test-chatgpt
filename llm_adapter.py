@@ -5,15 +5,15 @@ LLM adapter for:
   (B) per-chunk descriptors (brief/topics/negations)
 
 Routing (default):
-  1) OpenAI gpt-4.1-mini-2025-04-14  ← 버전 고정
-     (사용 불가 시 자동 폴백: gpt-4.1-mini)
+  1) OpenAI gpt-4.1-mini-2025-04-14  ← 버전 고정 (불가 시 gpt-4.1-mini로 자동 폴백)
   2) Google Gemini 2.5 Flash
   3) OpenAI gpt-5
 
 - Strict JSON schema validation
-- Conservative temperatures
+- Conservative temps
 - SQLite cache to reduce cost
 - Secrets: OPENAI_API_KEY, GOOGLE_API_KEY (또는 GEMINI_API_KEY)
+- NEW: 예외 메시지를 diag["errors"]에 남김 (앞 180자)
 """
 from __future__ import annotations
 import os, json, time, sqlite3, threading
@@ -144,18 +144,17 @@ class LLMRouter:
         self.law_conf_threshold = law_conf_threshold
         self.desc_conf_threshold = desc_conf_threshold
 
-    # 내부: primary가 버전 고정일 때 alias로도 재시도
     def _openai_primary_candidates(self) -> List[str]:
         cands = [self.primary_model]
         if self.primary_model.startswith("gpt-4.1-mini") and self.primary_model != "gpt-4.1-mini":
-            cands.append("gpt-4.1-mini")
+            cands.append("gpt-4.1-mini")  # alias 폴백
         return cands
 
     # ---- (A) Law name / doc_type ----
     def lawname_doctype(self, snippet: str):
         sys = "Answer in Thai where appropriate. Return JSON only."
         prompt = (
-            "คุณคือผู้ช่วย metadata ด้านกฎหมาย วิเคราะห์หัว/ต้นเรื่อง (Thai) แล้วส่งออก JSON สอดคล้องสคีมา:\n"
+            "คุณคือผู้ช่วย metadata ด้านกฎหมาย วิเคราะห์หัว/ต้นเรื่อง (Thai) แล้วส่งออก JSON ตามสคีมา:\n"
             "- doc_type: act|code|regulation|constitution|unknown\n"
             "- law_name: ชื่อกฎหมายแบบสั้นแต่ครบ\n"
             "- year_be: พ.ศ. ถ้ามี พบไม่ได้ให้ null\n"
@@ -163,9 +162,9 @@ class LLMRouter:
             "ห้ามคาดเดาเกินจริง ตอบเป็น JSON เท่านั้น"
         )
         key = _sha1("LAW|" + snippet[:1200])
-        diag = {"route": [], "cached": False}
+        diag = {"route": [], "cached": False, "errors": []}
 
-        # cache hit 우선
+        # cache 우선
         for provider, model in [("openai", self.primary_model),
                                 ("google", self.fallback1_model),
                                 ("openai", self.fallback2_model)]:
@@ -177,25 +176,28 @@ class LLMRouter:
 
         # OpenAI primary (버전 → alias 순회)
         for mdl in self._openai_primary_candidates():
-            obj = self._call_openai_json(mdl, sys, prompt, LAW_SCHEMA, snippet, 0)
+            obj, err = self._call_openai_json(mdl, sys, prompt, LAW_SCHEMA, snippet, 0)
             if obj and _validate_json(obj, LAW_SCHEMA):
                 _cache_set("openai", mdl, "law", key, obj)
                 diag["route"].append({"provider":"openai","model":mdl,"used":"live"})
                 return obj, diag
+            if err: diag["errors"].append({"provider":"openai","model":mdl,"error":err})
 
-        # Gemini fallback
-        obj = self._call_gemini_json(self.fallback1_model, sys, prompt, LAW_SCHEMA, snippet, 0.0)
+        # Gemini
+        obj, err = self._call_gemini_json(self.fallback1_model, sys, prompt, LAW_SCHEMA, snippet, 0.0)
         if obj and _validate_json(obj, LAW_SCHEMA):
             _cache_set("google", self.fallback1_model, "law", key, obj)
             diag["route"].append({"provider":"google","model":self.fallback1_model,"used":"live"})
             return obj, diag
+        if err: diag["errors"].append({"provider":"google","model":self.fallback1_model,"error":err})
 
-        # GPT-5 fallback
-        obj = self._call_openai_json(self.fallback2_model, sys, prompt, LAW_SCHEMA, snippet, 0)
+        # GPT-5
+        obj, err = self._call_openai_json(self.fallback2_model, sys, prompt, LAW_SCHEMA, snippet, 0)
         if obj and _validate_json(obj, LAW_SCHEMA):
             _cache_set("openai", self.fallback2_model, "law", key, obj)
             diag["route"].append({"provider":"openai","model":self.fallback2_model,"used":"live"})
             return obj, diag
+        if err: diag["errors"].append({"provider":"openai","model":self.fallback2_model,"error":err})
 
         diag["route"].append({"provider":"all","model":"failed","used":"none"})
         return None, diag
@@ -212,7 +214,7 @@ class LLMRouter:
         )
         snippet = chunk_text[:1200]
         key = _sha1("DESC|" + (section_label or "") + "|" + "|".join(breadcrumbs or []) + "|" + snippet)
-        diag = {"route": [], "cached": False}
+        diag = {"route": [], "cached": False, "errors": []}
 
         for provider, model in [("openai", self.primary_model),
                                 ("google", self.fallback1_model),
@@ -223,25 +225,30 @@ class LLMRouter:
                 diag["cached"] = True
                 return cached, diag
 
-        # OpenAI primary (버전 → alias 순회)
+        # OpenAI (버전→alias 순회)
         for mdl in self._openai_primary_candidates():
-            obj = self._call_openai_json(mdl, sys, prompt, DESC_SCHEMA, snippet, 0.3)
+            obj, err = self._call_openai_json(mdl, sys, prompt, DESC_SCHEMA, snippet, 0.3)
             if obj and _validate_json(obj, DESC_SCHEMA):
                 _cache_set("openai", mdl, "desc", key, obj)
                 diag["route"].append({"provider":"openai","model":mdl,"used":"live"})
                 return obj, diag
+            if err: diag["errors"].append({"provider":"openai","model":mdl,"error":err})
 
-        obj = self._call_gemini_json(self.fallback1_model, sys, prompt, DESC_SCHEMA, snippet, 0.3)
+        # Gemini
+        obj, err = self._call_gemini_json(self.fallback1_model, sys, prompt, DESC_SCHEMA, snippet, 0.3)
         if obj and _validate_json(obj, DESC_SCHEMA):
             _cache_set("google", self.fallback1_model, "desc", key, obj)
             diag["route"].append({"provider":"google","model":self.fallback1_model,"used":"live"})
             return obj, diag
+        if err: diag["errors"].append({"provider":"google","model":self.fallback1_model,"error":err})
 
-        obj = self._call_openai_json(self.fallback2_model, sys, prompt, DESC_SCHEMA, snippet, 0.3)
+        # GPT-5
+        obj, err = self._call_openai_json(self.fallback2_model, sys, prompt, DESC_SCHEMA, snippet, 0.3)
         if obj and _validate_json(obj, DESC_SCHEMA):
             _cache_set("openai", self.fallback2_model, "desc", key, obj)
             diag["route"].append({"provider":"openai","model":self.fallback2_model,"used":"live"})
             return obj, diag
+        if err: diag["errors"].append({"provider":"openai","model":self.fallback2_model,"error":err})
 
         diag["route"].append({"provider":"all","model":"failed","used":"none"})
         return None, diag
@@ -258,7 +265,7 @@ class LLMRouter:
             else: results.append(None); log["fail"] += 1
         return results, log
 
-    # ───────── provider calls ───────── #
+    # ───────── provider calls (return (obj, error)) ───────── #
 
     def _call_openai_json(self, model, system, prompt, schema, text, temperature):
         try:
@@ -277,9 +284,10 @@ class LLMRouter:
                 content = resp.output[0].content[0].text
             if not content and hasattr(resp,"choices"):
                 content = resp.choices[0].message["content"]
-            return json.loads(content) if content else None
-        except Exception:
-            return None
+            return (json.loads(content) if content else None, None)
+        except Exception as e:
+            msg = (f"{type(e).__name__}: {str(e)}")[:180]
+            return (None, msg)
 
     def _call_gemini_json(self, model, system, prompt, schema, text, temperature):
         try:
@@ -289,6 +297,7 @@ class LLMRouter:
             m = genai.GenerativeModel(model_name=model, system_instruction=system, generation_config=cfg)
             msg = f"{prompt}\n\n<document>\n{text}\n</document>"
             resp = m.generate_content([msg])
-            return json.loads(resp.text) if getattr(resp,"text",None) else None
-        except Exception:
-            return None
+            return (json.loads(resp.text) if getattr(resp,"text",None) else None, None)
+        except Exception as e:
+            msg = (f"{type(e).__name__}: {str(e)}")[:180]
+            return (None, msg)

@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-import time, json, os
+import time, json
 from typing import List, Dict, Any
 import streamlit as st
 
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import validate_tree, make_chunks, guess_law_name, repair_tree
-from parser_core.schema import ParseResult, Node, Chunk
+from parser_core.schema import ParseResult, Chunk
 from exporters.writers import to_jsonl, make_debug_report
 from llm_adapter import LLMRouter
 
-APP_TITLE = "Thai Legal Preprocessor — LLM-assisted (overlap visual, versioned model)"
+APP_TITLE = "Thai Legal Preprocessor — LLM + Overlap Visual (v2)"
 
+# ───────── CSS ───────── #
 def _inject_css():
     st.markdown("""
     <style>
@@ -18,24 +19,27 @@ def _inject_css():
       .docwrap { border:1px solid rgba(107,114,128,.25); border-radius:10px; padding:16px; }
       .doc { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
              font-size:13.5px; line-height:1.6; position:relative; }
-      .bracket-block { position:relative; padding:0 12px; border-radius:6px; margin:0 1px; }
-      .bracket-block::before, .bracket-block::after {
+
+      /* 전체 청크(연두 중괄호) */
+      .chunk-wrap { position:relative; padding:0 12px; border-radius:6px; margin:0 1px; }
+      .chunk-wrap::before, .chunk-wrap::after {
         content:"{"; position:absolute; top:-1px; bottom:-1px; width:10px;
         color:#a3e635; opacity:.90; font-weight:800;
       }
-      .bracket-block::before { left:0; } .bracket-block::after { right:0; transform:scaleX(-1); }
-      .overlap-bracket { position:relative; padding:0 10px; border-radius:6px; margin:0 1px; }
-      .overlap-bracket::before, .overlap-bracket::after {
-        content:"{"; position:absolute; top:-1px; bottom:-1px; width:8px;
-        color:#f472b6; opacity:.95; font-weight:800;
-      }
-      .overlap-bracket::before { left:0; } .overlap-bracket::after { right:0; transform:scaleX(-1); }
+      .chunk-wrap::before { left:0; }
+      .chunk-wrap::after  { right:0; transform:scaleX(-1); }
+
+      /* 오버랩(연핑크 배경 + 얇은 핑크 중괄호) */
+      .overlap { background: rgba(244,114,182,.22); }   /* pink-400 @ 22% */
+      .overlap-mark { color:#f472b6; font-weight:800; }
+
       .close-tail { color:#a3e635; font-weight:800; }
-      .dlbar { display:flex; gap:10px; align-items:center; margin:.6rem 0 .6rem; }
+      .dlbar { display:flex; gap:10px; align-items:center; margin:.6rem 0 .6rem; flex-wrap:wrap; }
       .parse-line { margin-top:.25rem; margin-bottom:.5rem; }
       .parse-line button { background:#22c55e !important; color:#fff !important; border:0 !important;
                            padding:.75rem 1.2rem !important; font-weight:800 !important; font-size:16px !important;
                            border-radius:10px !important; width:100%; }
+      .badge-warn { display:inline-block; padding:2px 8px; border-radius:8px; background:#fee2e2; color:#b91c1c; font-weight:700; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -47,13 +51,12 @@ def _ensure_state():
         "split_threshold_chars":1500, "tail_merge_min_chars":200, "overlap_chars":200,
         "number_scope":"article만", "bracket_front_matter":True,
         "use_llm_law":True, "use_llm_desc":True,
-        "report_json_str":"", "chunks_jsonl_str":""
-    }
+        "report_json_str":"", "chunks_jsonl_str":"", "llm_errors":[]}
     for k,v in defaults.items(): st.session_state.setdefault(k,v)
 
 def _coverage(chunks: List[Chunk], total_len: int) -> float:
     ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x:x[0])
-    merged=[]; 
+    merged=[]
     for s,e in ivs:
         if not merged or s>merged[-1][1]: merged.append([s,e])
         else: merged[-1][1]=max(merged[-1][1], e)
@@ -63,7 +66,8 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
 def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-def render_chunk_brackets_with_overlap(text: str, chunks: List[Chunk], *, number_scope="article만", bracket_front_matter=True) -> str:
+# ───────── 원문 렌더(오버랩 시각화) ───────── #
+def render_with_overlap(text: str, chunks: List[Chunk], *, number_scope="article만", bracket_front_matter=True) -> str:
     N=len(text)
     if number_scope=="전체 청크":
         units=[c for c in chunks if c.meta.get("type") in ("front_matter","article","headnote")]
@@ -80,15 +84,25 @@ def render_chunk_brackets_with_overlap(text: str, chunks: List[Chunk], *, number
         if s<0 or e>N or e<=s: continue
         if s>cur: parts.append(_esc(text[cur:s]))
 
+        # 코어스팬(문서 절대좌표) – 없거나 이상하면 전체를 코어로 간주
         cs,ce = c.meta.get("core_span",[s,e])
         if not (isinstance(cs,int) and isinstance(ce,int) and s<=cs<=ce<=e):
             cs,ce=s,e
 
-        parts.append(f'<span class="bracket-block" title="{_esc(c.meta.get("section_label","chunk"))}">')
-        if cs>s: parts.append(f'<span class="overlap-bracket">{_esc(text[s:cs])}</span>')
+        parts.append(f'<span class="chunk-wrap" title="{_esc(c.meta.get("section_label","chunk"))}">')
+
+        # 앞 오버랩
+        if cs>s:
+            parts.append('<span class="overlap-mark">{</span>')
+            parts.append(f'<span class="overlap">{_esc(text[s:cs])}</span>')
+        # 코어
         parts.append(_esc(text[cs:ce]))
-        if e>ce: parts.append(f'<span class="overlap-bracket">{_esc(text[ce:e])}</span>')
-        parts.append("</span>")
+        # 뒤 오버랩
+        if e>ce:
+            parts.append(f'<span class="overlap">{_esc(text[ce:e])}</span>')
+            parts.append('<span class="overlap-mark">}</span>')
+
+        parts.append("</span>")  # chunk-wrap 닫기
 
         idx+=1
         parts.append(f' <span class="close-tail">}} chunk {idx:04d}</span><br/>')
@@ -96,10 +110,11 @@ def render_chunk_brackets_with_overlap(text: str, chunks: List[Chunk], *, number
     if cur<N: parts.append(_esc(text[cur:N]))
     return '<div class="doc">'+"".join(parts)+"</div>"
 
+# ───────── Main ───────── #
 def main():
     _inject_css(); _ensure_state()
     st.title(APP_TITLE)
-    st.caption("연두 중괄호=청크 전체, 핑크 중괄호=오버랩(문맥) 부분. LLM은 버전 고정 모델 사용.")
+    st.caption("연두 중괄호=청크, 연핑크 배경=오버랩(문맥). LLM은 gpt-4.1-mini-2025-04-14 → gemini-2.5-flash → gpt-5 순서.")
 
     up = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
     with st.container():
@@ -156,13 +171,17 @@ def main():
         llm_log={"law":{}, "desc":{}}
         final_doc_type = result.doc_type or "unknown"
         final_law = base_law or ""
+        llm_errors: List[str] = []
+
         if st.session_state["use_llm_law"]:
             router = LLMRouter(
-                primary_model="gpt-4.1-mini-2025-04-14",   # ← 버전 고정
+                primary_model="gpt-4.1-mini-2025-04-14",
                 fallback1_model="gemini-2.5-flash",
                 fallback2_model="gpt-5",
             )
-            obj, diag = router.lawname_doctype(text[:1200]); llm_log["law"]={"diag":diag,"output":obj}
+            obj, diag = router.lawname_doctype(text[:1200])
+            llm_log["law"]={"diag":diag,"output":obj}
+            for e in diag.get("errors", []): llm_errors.append(f'{e.get("provider")}/{e.get("model")}: {e.get("error")}')
             if obj and obj.get("confidence",0)>=0.75:
                 final_doc_type = obj.get("doc_type") or final_doc_type
                 final_law = obj.get("law_name") or final_law
@@ -179,7 +198,10 @@ def main():
                 cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
                 core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
                 items.append((core[:1200], c.meta.get("section_label",""), c.breadcrumbs or []))
-            descs, dlog = router.describe_chunks_batch(items); llm_log["desc"]=dlog
+            descs, dlog = router.describe_chunks_batch(items)
+            llm_log["desc"]=dlog
+            for r in dlog.get("routes",[]):
+                for e in r.get("diag",{}).get("errors",[]): llm_errors.append(f'{e.get("provider")}/{e.get("model")}: {e.get("error")}')
             j=0
             for c in chunks:
                 if c.meta.get("type")!="article": continue
@@ -187,7 +209,23 @@ def main():
                 if obj:
                     c.meta["brief"]=obj.get("brief",""); c.meta["topics"]=obj.get("topics",[]); c.meta["negations"]=obj.get("negations",[])
 
+        st.session_state["llm_errors"] = llm_errors
+
+        # 4) REPORT (오버랩 샘플 10개 포함)
         cov=_coverage(chunks, len(result.full_text))
+        # 오버랩이 실제 있는 청크들 샘플
+        samples=[]
+        for c in chunks:
+            s,e=int(c.span_start),int(c.span_end)
+            cs,ce = c.meta.get("core_span",[s,e])
+            if isinstance(cs,int) and isinstance(ce,int) and (cs>s or ce<e):
+                samples.append({
+                    "section": c.meta.get("section_label",""),
+                    "span":[s,e], "core_span":[cs,ce],
+                    "uid": c.meta.get("section_uid","")
+                })
+                if len(samples)>=10: break
+
         report_str = make_debug_report(
             parse_result=result, chunks=chunks, source_file=src, law_name=final_law or "",
             run_config={
@@ -200,8 +238,12 @@ def main():
                 "use_llm_law":st.session_state["use_llm_law"], "use_llm_desc":st.session_state["use_llm_desc"],
                 "primary_llm_model":"gpt-4.1-mini-2025-04-14"
             },
-            debug={"tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**rep_diag},
-                   "make_chunks_diag":mk_diag or {}, "coverage_calc":{"coverage":cov}, "llm":llm_log}
+            debug={
+                "tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**rep_diag},
+                "make_chunks_diag":{**(mk_diag or {}), "overlap_samples":samples},
+                "coverage_calc":{"coverage":cov},
+                "llm":llm_log
+            }
         )
         chunks_str = to_jsonl(chunks)
 
@@ -211,6 +253,7 @@ def main():
             "issues":issues_after, "report_json_str":report_str, "chunks_jsonl_str":chunks_str
         })
 
+    # ───── 표시 & 다운로드 ─────
     if st.session_state["parsed"]:
         cov=_coverage(st.session_state["chunks"], len(st.session_state["result"].full_text))
         arts=[c for c in st.session_state["chunks"] if c.meta.get("type")=="article"]
@@ -221,6 +264,14 @@ def main():
             f"**chunks:** {len(st.session_state['chunks'])} (article {len(arts)})  |  "
             f"**coverage:** {cov:.6f}"
         )
+
+        # LLM 에러 요약 배지
+        if st.session_state["llm_errors"]:
+            st.markdown(f'<span class="badge-warn">LLM 실패 {len(st.session_state["llm_errors"])}건</span>', unsafe_allow_html=True)
+            with st.expander("LLM 실패 사유 보기"):
+                for e in st.session_state["llm_errors"]:
+                    st.code(e)
+
         st.markdown('<div class="dlbar">', unsafe_allow_html=True)
         st.download_button("JSONL 다운로드", st.session_state["chunks_jsonl_str"].encode("utf-8"),
                            file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks.jsonl",
@@ -230,7 +281,7 @@ def main():
                            mime="application/json", key="dl-report-bottom")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        html = render_chunk_brackets_with_overlap(
+        html = render_with_overlap(
             text=st.session_state["result"].full_text,
             chunks=st.session_state["chunks"],
             number_scope=st.session_state["number_scope"],
