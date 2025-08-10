@@ -6,14 +6,18 @@ import streamlit as st
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import validate_tree, make_chunks, guess_law_name, repair_tree
 from parser_core.schema import ParseResult, Chunk
-from exporters.writers import to_jsonl, make_debug_report
+from exporters.writers import (
+    to_jsonl_rich_meta,
+    to_jsonl_compat_flat,
+    make_debug_report,
+)
 
 from llm_clients import call_openai_summary, call_openai_batch
 from extractors import build_summary_record
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)  (Batch+Cache)"
+APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)  (Batch+Cache, Dual Exports)"
 
 # ---------- 스타일 ----------
 def _inject_css():
@@ -51,13 +55,13 @@ def _ensure_state():
         "strict_lossless":True, "split_long_articles":True,
         "split_threshold_chars":1500, "tail_merge_min_chars":200, "overlap_chars":200,
         "bracket_front_matter":True, "bracket_headnotes":True,
-        "use_llm_summary":True, "llm_errors":[], "report_json_str":"", "chunks_jsonl_str":"",
+        "use_llm_summary":True, "llm_errors":[], "report_json_str":"", "chunks_jsonl_rich":"", "chunks_jsonl_flat":"",
         # LLM 성능/비용 옵션
-        "skip_short_chars":180,     # 이 길이보다 짧으면 LLM 스킵(로컬 규칙만)
-        "batch_group_size":8,       # 한 호출에 묶을 섹션 수
-        "parallel_calls":3,         # 동시에 몇 배치 호출
-        "max_calls":0,              # 0이면 제한 없음
-        "llm_cache":{}              # sha1(text) -> {"text":llm_text,"rec":summary_record}
+        "skip_short_chars":180,
+        "batch_group_size":8,
+        "parallel_calls":3,
+        "max_calls":0,
+        "llm_cache":{}
     }
     for k,v in defaults.items(): st.session_state.setdefault(k,v)
 
@@ -130,6 +134,7 @@ class RunPanel:
 
 # --------- 유틸 ----------
 def _sha1(s: str) -> str:
+    import hashlib
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 # ---------- 메인 ----------
@@ -223,8 +228,7 @@ def main():
 
             if st.session_state["use_llm_summary"]:
                 panel.step("4/6 LLM 요약(배치)")
-                # 준비: 캐시/스킵 처리
-                pending: List[Tuple[str, Chunk, str]] = []  # (id, chunk, core_text)
+                pending: List[Tuple[str, Chunk, str]] = []
                 ready_count = 0
                 for idx, c in enumerate(arts, 1):
                     cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
@@ -232,7 +236,6 @@ def main():
                     core = core.strip()
                     if len(core) <= 0:
                         continue
-                    # 스킵: 짧은 본문은 로컬 규칙으로
                     key = _sha1(core)
                     if len(core) <= skip_short:
                         rec = build_summary_record(
@@ -240,7 +243,7 @@ def main():
                             section_label=c.meta.get("section_label",""),
                             breadcrumbs=c.breadcrumbs or [],
                             span=(c.span_start, c.span_end),
-                            llm_text=core,  # 본문을 직접 요약 입력으로 사용
+                            llm_text=core,
                             brief_max_len=180
                         )
                         c.meta.update({
@@ -249,7 +252,6 @@ def main():
                         })
                         ready_count += 1
                         continue
-                    # 캐시 히트
                     if key in cache:
                         rec = cache[key]["rec"]
                         c.meta.update({
@@ -258,17 +260,16 @@ def main():
                         })
                         ready_count += 1
                         continue
-                    # 배치 후보
                     pending.append((f"A{idx:04d}", c, core))
 
                 panel.log(f"스킵/캐시 적용 완료 · 즉시완료 {ready_count} / 대기 {len(pending)}")
+
                 total_batches = math.ceil(len(pending) / st.session_state["batch_group_size"])
                 if st.session_state["max_calls"] and total_batches > st.session_state["max_calls"]:
                     total_batches = st.session_state["max_calls"]
                 panel.log(f"배치 호출 예정: {total_batches}개")
 
-                # 배치 작업자
-                def _run_batch(batch_items: List[Tuple[str, Chunk, str]]) -> Dict[str,Any]:
+                def _run_batch(batch_items):
                     sections = []
                     for bid, ch, core in batch_items:
                         sections.append({
@@ -279,27 +280,22 @@ def main():
                         })
                     return call_openai_batch(sections, max_tokens=1200, temperature=0.2)
 
-                # 실행
                 done_calls = 0
                 workers = max(1, min(8, st.session_state["parallel_calls"]))
                 group = max(2, min(20, st.session_state["batch_group_size"]))
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures=[]
-                    cursor=0
+                    futures=[]; cursor=0
                     while cursor < len(pending) and (st.session_state["max_calls"]==0 or done_calls < st.session_state["max_calls"]):
                         batch = pending[cursor: cursor+group]
                         futures.append(ex.submit(_run_batch, batch))
                         done_calls += 1
                         cursor += group
-
-                    # 수집
                     for fut in as_completed(futures):
                         r = fut.result()
                         if not r.get("ok"):
-                            llm_errors.append(str(r.get("error")))
-                            continue
+                            llm_errors.append(str(r.get("error"))); continue
                         id_map = r.get("map", {})
-                        # 결과 매핑 및 캐시 저장
                         for bid, ch, core in pending:
                             if bid in id_map:
                                 txt = id_map[bid]
@@ -340,7 +336,7 @@ def main():
 
             st.session_state["llm_errors"] = llm_errors
 
-            # 5) REPORT/JSONL
+            # 5) REPORT/JSONL (여기서 두 가지 형식 모두 생성)
             panel.step("5/6 리포트/저장")
             cov=_coverage(chunks, len(result.full_text))
             report_str = make_debug_report(
@@ -365,11 +361,16 @@ def main():
                     "llm":{"errors":llm_errors, "cache_size":len(st.session_state["llm_cache"])}
                 }
             )
-            chunks_str = to_jsonl(chunks)
+
+            # 두 가지 JSONL
+            jsonl_rich = to_jsonl_rich_meta(chunks)
+            jsonl_flat = to_jsonl_compat_flat(chunks, parse_result=result)
+
             st.session_state.update({
                 "parsed":True, "result":result, "chunks":chunks,
                 "doc_type":result.doc_type or "unknown", "law_name":base_law or "",
-                "issues":issues_after, "report_json_str":report_str, "chunks_jsonl_str":chunks_str
+                "issues":issues_after, "report_json_str":report_str,
+                "chunks_jsonl_rich":jsonl_rich, "chunks_jsonl_flat":jsonl_flat
             })
             panel.tick("리포트/저장", inc=10)
 
@@ -401,9 +402,13 @@ def main():
                     st.code(e)
 
         st.markdown('<div class="dlbar">', unsafe_allow_html=True)
-        st.download_button("JSONL 다운로드", st.session_state["chunks_jsonl_str"].encode("utf-8"),
-                           file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks.jsonl",
-                           mime="application/json", key="dl-jsonl-bottom")
+        # 두 가지 JSONL 모두 제공
+        st.download_button("JSONL 다운로드 — Rich Meta", st.session_state["chunks_jsonl_rich"].encode("utf-8"),
+                           file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks_rich.jsonl",
+                           mime="application/json", key="dl-jsonl-rich")
+        st.download_button("JSONL 다운로드 — Compat Flat", st.session_state["chunks_jsonl_flat"].encode("utf-8"),
+                           file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks_compat.jsonl",
+                           mime="application/json", key="dl-jsonl-flat")
         st.download_button("DEBUG 다운로드 (REPORT.json)", st.session_state["report_json_str"].encode("utf-8"),
                            file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_REPORT.json",
                            mime="application/json", key="dl-report-bottom")

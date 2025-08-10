@@ -1,267 +1,254 @@
 # -*- coding: utf-8 -*-
+"""
+Export helpers
+- JSONL (Compat Flat / Rich Meta)
+- REPORT.json builder (기존 유지)
+"""
 from __future__ import annotations
-from typing import List, Dict, Tuple, Any
-import io
 import json
-import zipfile
-from datetime import datetime
-import re
-from collections import Counter
+from typing import List, Dict, Any, Optional, Tuple
 
-from parser_core.schema import ParseResult, Chunk
-from parser_core.rules_th import normalize_text
+# ---- 타입 힌트 (런타임 의존 없음) --------------------------------------------
+try:
+    from parser_core.schema import ParseResult, Chunk  # type: ignore
+except Exception:  # pragma: no cover
+    ParseResult = Any  # type: ignore
+    Chunk = Any        # type: ignore
 
-def to_jsonl(chunks: List[Chunk]) -> str:
-    lines = []
+
+# ------------------------------------------------------------------------------
+# 내부 유틸
+# ------------------------------------------------------------------------------
+
+def _meta_common(c: Chunk) -> Dict[str, Any]:
+    """청크 메타 공통 필드 정규화"""
+    m = dict(c.meta or {})
+    return {
+        "type": m.get("type") or "article",
+        "law_name": m.get("law_name") or "",
+        "section_label": m.get("section_label") or "",
+        "breadcrumbs": list(getattr(c, "breadcrumbs", []) or []),
+        "source_file": m.get("source_file") or "",
+        # 위치 정보
+        "span": [int(getattr(c, "span_start", 0)), int(getattr(c, "span_end", 0))],
+        "core_span": list(m.get("core_span") or []),
+        # RAG 도움이 되는 필드
+        "section_uid": m.get("section_uid") or "",
+        "parent_uid": m.get("parent_uid") or "",
+        "doc_type": m.get("doc_type") or "",
+    }
+
+
+def _record_from_chunk_rich(c: Chunk) -> Dict[str, Any]:
+    """Rich Meta용 1 레코드"""
+    meta = _meta_common(c)
+
+    # LLM 사후구조화 결과(있을 때만)
+    for k in ("brief", "topics", "negations", "summary_text_raw", "quality"):
+        if k in (c.meta or {}):
+            meta[k] = c.meta[k]
+
+    # 팩(있을 때만): members를 통째로 메타에 넣는다.
+    if (c.meta or {}).get("type") == "article_pack":
+        # 기대 스키마:
+        # c.meta["pack_members"] : [{"label":..., "span":[s,e], "offset_in_pack":[a,b], ...}, ...]
+        # c.meta["section_range"] : "มาตรา 118–121"
+        for k in ("pack_members", "section_range", "pack_reason", "pack_stats"):
+            if k in c.meta:
+                meta[k] = c.meta[k]
+
+    return {
+        "id": c.meta.get("uid") or c.meta.get("section_uid") or c.meta.get("section_label") or f"chunk_{meta['span'][0]}_{meta['span'][1]}",
+        "text": c.text,
+        "metadata": meta,
+    }
+
+
+def _slice_text_from_doc(parse_result: Optional[ParseResult], abs_span: Optional[Tuple[int, int]], pack_text: Optional[str], rel_span: Optional[Tuple[int, int]], pack_core_offset: Optional[int]) -> str:
+    """
+    멤버 텍스트를 안전하게 잘라서 반환.
+    우선순위: 절대 스팬 → (팩 텍스트 + 상대 스팬) → 빈 문자열
+    - abs_span: (start,end) in original document
+    - pack_text: c.text (팩 콘텐츠)
+    - rel_span: (start,end) relative to pack content (offset_in_pack)
+    - pack_core_offset: pack core start relative to pack span (optional)
+    """
+    try:
+        if parse_result and abs_span and isinstance(abs_span[0], int) and isinstance(abs_span[1], int):
+            s, e = abs_span
+            if 0 <= s < e <= len(parse_result.full_text):
+                return parse_result.full_text[s:e]
+    except Exception:
+        pass
+
+    try:
+        if pack_text is not None and rel_span and isinstance(rel_span[0], int) and isinstance(rel_span[1], int):
+            a, b = rel_span
+            # pack_core_offset이 주어지면 보정
+            if isinstance(pack_core_offset, int) and pack_core_offset > 0:
+                a += pack_core_offset
+                b += pack_core_offset
+            if 0 <= a < b <= len(pack_text):
+                return pack_text[a:b]
+    except Exception:
+        pass
+
+    return ""
+
+
+def _explode_pack_to_flat(
+    c: Chunk,
+    parse_result: Optional[ParseResult]
+) -> List[Dict[str, Any]]:
+    """
+    article_pack -> 멤버별로 '표준 청크' 레코드 생성 (Compat Flat)
+    - abs span, or offset_in_pack 로 텍스트 확보 시도
+    - 실패 시: pack 본문 그대로 텍스트를 넣되 member label 메타만 바꿔서 최소 호환 확보
+    """
+    items: List[Dict[str, Any]] = []
+
+    pack_meta = c.meta or {}
+    members = pack_meta.get("pack_members") or pack_meta.get("members") or []
+    if not members:
+        # 멤버 정보가 없으면 팩 자체를 일반 청크처럼 내보낸다(최소 호환).
+        items.append(_record_from_chunk_rich(c))
+        return items
+
+    # 팩 공통 메타
+    base = _meta_common(c)
+    base_type = "article"  # 외부에는 일반 청크처럼 보이게
+    base.pop("core_span", None)
+
+    pack_core_span = (pack_meta.get("core_span") or base.get("core_span") or [0, 0])
+    pack_core_offset = 0
+    if isinstance(pack_core_span, (list, tuple)) and len(pack_core_span) == 2:
+        try:
+            pack_core_offset = int(pack_core_span[0]) - int(base["span"][0])
+        except Exception:
+            pack_core_offset = 0
+
+    for i, m in enumerate(members, start=1):
+        label = m.get("label") or m.get("section_label") or f"member_{i}"
+        abs_span = None
+        rel_span = None
+        if isinstance(m.get("span"), (list, tuple)) and len(m["span"]) == 2:
+            abs_span = (int(m["span"][0]), int(m["span"][1]))
+        if isinstance(m.get("offset_in_pack"), (list, tuple)) and len(m["offset_in_pack"]) == 2:
+            rel_span = (int(m["offset_in_pack"][0]), int(m["offset_in_pack"][1]))
+
+        member_text = _slice_text_from_doc(parse_result, abs_span, c.text, rel_span, pack_core_offset)
+        if not member_text:
+            # 안전 폴백: pack 전체 텍스트 사용 (중복은 생기지만 호환은 유지)
+            member_text = c.text
+
+        md = dict(base)
+        md.update({
+            "type": base_type,
+            "section_label": label,
+            "section_uid": m.get("uid") or m.get("section_uid") or "",
+            "pack_origin": (pack_meta.get("uid") or pack_meta.get("section_uid") or ""),
+            "pack_section_range": pack_meta.get("section_range") or "",
+        })
+        # LLM/요약이 팩 레벨에만 있는 경우도 있어 복사(선택)
+        for k in ("brief", "topics", "negations", "quality"):
+            if k in pack_meta:
+                md[k] = pack_meta[k]
+
+        items.append({
+            "id": md.get("section_uid") or md.get("section_label") or f"pack_flat_{i}",
+            "text": member_text,
+            "metadata": md,
+        })
+
+    return items
+
+
+# ------------------------------------------------------------------------------
+# 공개 API: JSONL
+# ------------------------------------------------------------------------------
+
+def to_jsonl_rich_meta(chunks: List[Chunk]) -> str:
+    """
+    팩/LLM 메타를 그대로 보존한 JSONL (RAG + 감사/디버깅에 유리)
+    """
+    out = []
     for c in chunks:
-        obj = {
-            "text": c.text,
-            "span": [c.span_start, c.span_end],
-            "node_ids": c.node_ids,
-            "breadcrumbs": c.breadcrumbs,
-            "meta": c.meta,
-        }
-        lines.append(json.dumps(obj, ensure_ascii=False))
-    return "\n".join(lines)
+        rec = _record_from_chunk_rich(c)
+        out.append(json.dumps(rec, ensure_ascii=False))
+    return "\n".join(out)
 
-def make_zip_bundle(
-    source_text: str,
+
+def to_jsonl_compat_flat(chunks: List[Chunk], parse_result: Optional[ParseResult] = None) -> str:
+    """
+    표준 RAG 파이프라인 친화(JSON만 보고도 동작).
+    - article_pack을 멤버별 '일반 청크'로 분해
+    - 일반 청크는 그대로
+    """
+    out: List[str] = []
+    for c in chunks:
+        ctype = (c.meta or {}).get("type") or "article"
+        if ctype == "article_pack":
+            for rec in _explode_pack_to_flat(c, parse_result):
+                out.append(json.dumps(rec, ensure_ascii=False))
+        else:
+            # 그냥 일반 청크
+            rec = _record_from_chunk_rich(c)
+            # Rich와의 차이를 최소화하려면 그대로 쓰되 pack 관련 키 제거
+            rec["metadata"].pop("pack_members", None)
+            rec["metadata"].pop("pack_reason", None)
+            rec["metadata"].pop("pack_stats", None)
+            rec["metadata"].pop("section_range", None)
+            out.append(json.dumps(rec, ensure_ascii=False))
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------------------------
+# REPORT.json (기존 함수 유지)  -----------------------------------------------
+# ------------------------------------------------------------------------------
+
+def make_debug_report(
+    *,
     parse_result: ParseResult,
     chunks: List[Chunk],
     source_file: str,
     law_name: str,
-    run_config: Dict[str, Any] | None = None,
-    debug: Dict[str, Any] | None = None,
-) -> io.BytesIO:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("SOURCE.txt", source_text)
-        zf.writestr("CHUNKS.jsonl", to_jsonl(chunks))
-        zf.writestr("REPORT.json", make_debug_report(parse_result, chunks, source_file, law_name, run_config, debug))
-    buf.seek(0)
-    return buf
+    run_config: Dict[str, Any],
+    debug: Dict[str, Any]
+) -> str:
+    """
+    디버그/품질 진단용 REPORT.json 문자열
+    """
+    import statistics as stats
 
-# ───────────────────────────── helpers ───────────────────────────── #
+    # 길이 통계
+    lens = [len(c.text) for c in chunks]
+    lens_sorted = sorted(lens)
+    p50 = lens_sorted[len(lens_sorted)//2] if lens_sorted else 0
+    p75 = lens_sorted[int(len(lens_sorted)*0.75)] if lens_sorted else 0
+    top_long = sorted(
+        [{"section": (c.meta or {}).get("section_label",""), "len": len(c.text)} for c in chunks],
+        key=lambda x: -x["len"]
+    )[:5]
+    top_short = sorted(
+        [{"section": (c.meta or {}).get("section_label",""), "len": len(c.text)} for c in chunks],
+        key=lambda x: x["len"]
+    )[:5]
 
-def _span_union(chunks: List[Chunk]) -> Tuple[int, List[Tuple[int,int]]]:
-    ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
-    merged: List[List[int]] = []
-    for s, e in ivs:
-        if not merged or s > merged[-1][1]:
-            merged.append([s, e])
-        else:
-            merged[-1][1] = max(merged[-1][1], e)
-    return sum(e - s for s, e in merged), [(s,e) for s,e in merged]
-
-def _count_articles_in_source(src_text: str) -> int:
-    norm = normalize_text(src_text)
-    NBSP = "\u00A0"
-    RE_NUM = r"(?P<num>\d{1,4}(?:/\d{1,3})?)"
-    TAIL_NUM = r"(?:\s*\.?)"
-    _sp = r"[ \t" + NBSP + r"]+"
-    pat_article = re.compile(rf"(?m)^(?P<label>มาตรา){_sp}{RE_NUM}{TAIL_NUM}\b")
-    return len(list(pat_article.finditer(norm)))
-
-def _overlap_diagnostics(chunks: List[Chunk]) -> Dict[str, Any]:
-    chs = sorted(chunks, key=lambda c: (c.span_start, c.span_end))
-    overlaps=0
-    by_pair: Counter = Counter()
-    last_s=last_e=None; last_t="?"
-    for c in chs:
-        s,e = c.span_start, c.span_end; t = c.meta.get("type","article")
-        if last_s is not None and s < last_e:
-            overlaps += 1; by_pair[(last_t, t)] += 1
-        last_s, last_e, last_t = s,e,t
-    return {"overlaps": overlaps,
-            "overlap_pairs_by_type": {f"{a}->{b}": cnt for (a,b),cnt in by_pair.items()}}
-
-def _tree_stats(parse_result: ParseResult) -> Dict[str, Any]:
-    by_label: Counter = Counter(n.label or "?" for n in parse_result.all_nodes)
-    depth_max = max((n.level for n in parse_result.all_nodes), default=0)
-    empty_nodes = [f"{n.label} {n.num}".strip() for n in parse_result.all_nodes if (n.text is not None and len(n.text.strip()) == 0)]
-    span_issues = []
-    for p in parse_result.all_nodes:
-        for ch in p.children:
-            if ch.span_start < p.span_start or ch.span_end > p.span_end:
-                span_issues.append(f"child outside parent: {ch.label} {ch.num} in {p.label} {p.num}")
-    return {"node_count": len(parse_result.all_nodes),
-            "by_label": dict(by_label),
-            "max_depth": depth_max,
-            "empty_nodes": empty_nodes[:20],
-            "span_issues": span_issues[:20]}
-
-def _duplicates(chunks: List[Chunk]) -> Dict[str, Any]:
-    import hashlib
-    hash_to_idxs: Dict[str, List[int]] = {}
-    region_key: Dict[Tuple[Tuple[str,...], Tuple[int,int]], List[int]] = {}
-    for i,c in enumerate(chunks):
-        h = hashlib.sha1(c.text.encode("utf-8")).hexdigest()
-        hash_to_idxs.setdefault(h, []).append(i)
-        k = (tuple(c.breadcrumbs or []), (c.span_start, c.span_end))
-        region_key.setdefault(k, []).append(i)
-    exact_groups = sorted([(h, idxs) for h,idxs in hash_to_idxs.items() if len(idxs)>1], key=lambda x: len(x[1]), reverse=True)
-    region_dups = sorted([(k, idxs) for k,idxs in region_key.items() if len(idxs)>1], key=lambda x: len(x[1]), reverse=True)
-    return {"exact_dup_groups": len(exact_groups),
-            "region_dup_groups": len(region_dups),
-            "exact_dup_top": [{"count": len(idxs)} for h,idxs in exact_groups[:5]]}
-
-def _largest_gaps(full_text: str, chunks: List[Chunk], topn: int = 5) -> List[Dict[str, Any]]:
-    total = len(full_text)
-    ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
-    merged = []
-    for s,e in ivs:
-        if not merged or s > merged[-1][1]:
-            merged.append([s,e])
-        else:
-            merged[-1][1] = max(merged[-1][1], e)
-    gaps = []; prev = 0
-    for s,e in merged:
-        if s>prev: gaps.append((prev, s))
-        prev=e
-    if prev < total: gaps.append((prev, total))
-    def snip(s,e): return full_text[s:min(s+200, len(full_text))].replace("\n","⏎")
-    gaps_sorted = sorted(gaps, key=lambda g: (g[1]-g[0]), reverse=True)[:topn]
-    return [{"span": [s,e], "len": e-s, "preview": snip(s,e)} for s,e in gaps_sorted]
-
-# ───────────────────────────── 조문 크기 통계 ───────────────────────────── #
-
-def _percentiles(vals: List[int]) -> Dict[str, float]:
-    if not vals: return {"p25":0,"p50":0,"p75":0,"min":0,"max":0,"mean":0.0}
-    s = sorted(vals)
-    def q(p: float) -> float:
-        k = (len(s)-1)*p; a = int(k); b = a+1
-        if b >= len(s): return float(s[a])
-        return float(s[a] + (s[b]-s[a])*(k-a))
-    return {"min": float(s[0]), "p25": q(0.25), "p50": q(0.50),
-            "p75": q(0.75), "max": float(s[-1]), "mean": float(sum(s)/len(s))}
-
-def _histogram(vals: List[int]) -> Dict[str, int]:
-    buckets = [(0,200),(200,500),(500,1000),(1000,2000),(2000,5000),(5000,10**9)]
-    names = ["0-200","200-500","500-1000","1000-2000","2000-5000","5000+"]
-    counts = {n:0 for n in names}
-    for v in vals:
-        for (lo,hi),name in zip(buckets,names):
-            if lo <= v < hi: counts[name] += 1; break
-    return counts
-
-def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
-    arts = [c for c in chunks if c.meta.get("type","article")=="article"]
-    lens = [len(c.text) for c in arts]
-    sizes = _percentiles(lens)
-    hist = _histogram(lens)
-    by_series: Counter = Counter(c.meta.get("series","1") for c in arts)
-    by_series_total: Counter = Counter(c.meta.get("series_total","1") for c in arts)
-    arts_sorted = sorted(arts, key=lambda c: len(c.text))
-    def bc(c: Chunk) -> str:
-        return " / ".join(c.breadcrumbs or [])
-    shortest = [{"section_label": c.meta.get("section_label",""),
-                 "breadcrumbs": bc(c),
-                 "section_uid": c.meta.get("section_uid",""),
-                 "series_index": c.meta.get("series_index","1"),
-                 "series_total": c.meta.get("series_total","1"),
-                 "len": len(c.text)} for c in arts_sorted[:5]]
-    longest  = [{"section_label": c.meta.get("section_label",""),
-                 "breadcrumbs": bc(c),
-                 "section_uid": c.meta.get("section_uid",""),
-                 "series_index": c.meta.get("series_index","1"),
-                 "series_total": c.meta.get("series_total","1"),
-                 "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
-
-    # 리포트 헤더용 시리즈 요약(실제 청크 기준)
-    split_summary = {
-        "series_total_counts": dict(by_series_total),  # 예: {"1": 110, "2": 80, "3": 28}
-        "series_index_counts": dict(Counter(c.meta.get("series_index","1") for c in arts))
-    }
-
-    return {"count": len(arts),
-            "length_stats_chars": sizes,
-            "length_histogram": hist,
-            "series_counts": dict(by_series),
-            "series_total_counts": dict(by_series_total),
-            "split_summary": split_summary,
-            "top_shortest": shortest,
-            "top_longest": longest}
-
-# ───────────────────────────── REPORT ───────────────────────────── #
-
-def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_file: str,
-                      law_name: str, run_config: Dict[str, Any] | None = None,
-                      debug: Dict[str, Any] | None = None) -> str:
-    full = parse_result.full_text
-    union_len, merged = _span_union(chunks)
-    src_len = len(full)
-    coverage = (union_len / src_len) if src_len else 0.0
-
-    integ = _overlap_diagnostics(chunks)
-    mismatches = 0
-    for c in chunks:
-        if full[c.span_start:c.span_end] != c.text: mismatches += 1
-    integ["text_mismatches"] = mismatches
-
-    type_counts = Counter(c.meta.get("type","article") for c in chunks)
-    type_sizes = Counter()
-    for c in chunks:
-        type_sizes[c.meta.get("type","article")] += len(c.text)
-
-    mk_diag = (debug or {}).get("make_chunks_diag", {}) if debug else {}
-    strict_post_fill = mk_diag.get("strict_post_fill", {"enabled": False, "filled_gaps": 0, "total_chars": 0, "spans": []})
-
-    # 파이프라인 회계(제거 사유)
-    removals = mk_diag.get("removals", {})
-    headnote_candidates = mk_diag.get("headnote_candidates", 0)
-    headnote_after_filter = mk_diag.get("headnote_after_filter", 0)
-    final_headnote_count = mk_diag.get("final_headnote_count", 0)
-    removed_total = sum(removals.values()) if isinstance(removals, dict) else 0
-    accounting_ok = (final_headnote_count <= headnote_after_filter)
-
-    # 트리 수복 진단 + 분할/테일 병합 진단
-    tree_repair = (debug or {}).get("tree_repair", {}) if debug else {}
-    split_diag = mk_diag.get("split", {})
-    tail_merge = mk_diag.get("tail_merge", {})
-
-    article_stats = _article_size_stats(chunks)
-
-    report = {
-        "source_file": source_file,
+    obj = {
+        "file": source_file,
+        "doc_type": (parse_result.doc_type or "unknown"),
         "law_name": law_name,
-        "doc_type": parse_result.doc_type,
-        "run_config": run_config or {},
-        "tree": _tree_stats(parse_result),
-        "tree_repair": tree_repair,
-        "chunks": {
-            "count": len(chunks),
-            "type_counts": dict(type_counts),
-            "type_sizes": dict(type_sizes),
+        "chunks": len(chunks),
+        "coverage": debug.get("coverage_calc",{}).get("coverage", 0.0),
+        "length_stats": {
+            "p50": p50,
+            "p75": p75,
+            "max": max(lens) if lens else 0,
+            "min": min(lens) if lens else 0,
+            "top_longest": top_long,
+            "top_shortest": top_short
         },
-        "coverage": {
-            "source_len_chars": src_len,
-            "union_len_chars": union_len,
-            "coverage_span_union": round(coverage, 6),
-            "largest_gaps_top5": _largest_gaps(full, chunks, topn=5),
-        },
-        "integrity": integ,
-        "duplicates": _duplicates(chunks),
-        "article_parity": {
-            "source_article_count": _count_articles_in_source(full),
-            "chunk_article_count": sum(1 for c in chunks if c.meta.get("type","article")=="article")
-        },
-        # 확장된 조문 통계(시리즈 요약 포함)
-        "article_size_stats": article_stats,
-        "pipeline_accounting": {
-            "headnote": {
-                "candidates": headnote_candidates,
-                "kept_after_filter": headnote_after_filter,
-                "final_in_chunks": final_headnote_count,
-            },
-            "removals_by_reason": removals,
-            "removed_total_estimate": removed_total,
-            "consistency_check_ok": accounting_ok,
-        },
-        "split": split_diag,
-        "tail_merge": tail_merge,
-        "strict_post_fill": strict_post_fill,
-        "sample_chunk_head": (chunks[0].text[:400] if chunks else ""),
-        "debug": debug or {},
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "run_config": run_config,
+        "debug": debug,
     }
-    return json.dumps(report, ensure_ascii=False, indent=2)
+    return json.dumps(obj, ensure_ascii=False, indent=2)
