@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import List, Optional, Tuple, Dict, Any
+import re
 
 from .schema import ParseResult, Node, Chunk
 from .rules_th import normalize_text
@@ -84,18 +85,42 @@ def _subtract_intervals(outer: Tuple[int, int], covered: List[Tuple[int, int]]) 
 # ───────────────────────────── 제목/연도 추출 ───────────────────────────── #
 
 _THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+THAI_MONTHS = ["มกราคม","กุมภาพันธ์","มีนาคม","เมษายน","พฤษภาคม","มิถุนายน","กรกฎาคม","สิงหาคม","กันยายน","ตุลาคม","พฤศจิกายน","ธันวาคม"]
 
 def _thai_to_arabic(s: str) -> str:
     return s.translate(_THAI_DIGITS)
+
+def _is_promulgation_line(ln: str) -> bool:
+    # 공포문/날짜 라인 패턴 (law_name에는 제외)
+    keys = [
+        "ให้ไว้ ณ", "ให้ไว้  ณ", "ให้ไว้ ณ วันที่",
+        "ประกาศ ณ", "ในพระปรมาภิไธย", "ราชกิจจานุเบกษา"
+    ]
+    if any(k in ln for k in keys):
+        return True
+    # "วันที่ ... (Thai month) พ.ศ." 형태를 포함하되, 단독 'พ.ศ.'만 있는 연도 라인은 제외
+    if "วันที่" in ln and any(m in ln for m in THAI_MONTHS):
+        return True
+    return False
+
+_YEAR_PAT = re.compile(r"(พ\.?\s*ศ\.?|พศ)\s*([0-9]{4})")
+
+def _extract_year_phrase(s: str) -> Optional[str]:
+    s2 = _thai_to_arabic(s)
+    m = _YEAR_PAT.search(s2)
+    if not m:
+        return None
+    return f"พ.ศ. {m.group(2)}"
 
 def guess_law_name(text: str) -> Optional[str]:
     """
     제목 + 부제 + 연도(พ.ศ.) 결합
     - 태국 숫자 → 아라비아 숫자 변환
     - 첫 표제행 + 다음 1~5행에서 부제/연도 탐색
+    - 공포문/날짜 라인은 law_name에서 제외
     """
     norm = normalize_text(text)
-    lines = [ln.strip(" \t-–—") for ln in norm.splitlines()[:120] if ln.strip()]
+    lines = [ln.strip(" \t-–—") for ln in norm.splitlines()[:160] if ln.strip()]
     base_idx = None
     for i, ln in enumerate(lines):
         if ("พระราชบัญญัติ" in ln) or ("ประมวลกฎหมาย" in ln):
@@ -106,25 +131,32 @@ def guess_law_name(text: str) -> Optional[str]:
 
     title = lines[base_idx]
     subline = ""
-    yearline = ""
+    year_phrase = ""
+
     for j in range(base_idx + 1, min(base_idx + 6, len(lines))):
         ln = lines[j]
         if any(k in ln for k in ("ภาค", "ลักษณะ", "หมวด", "ส่วน", "บท", "มาตรา")):
             break
-        if ("พ.ศ." in ln) or ("พ. ศ." in ln) or ("พศ" in ln):
-            yearline = ln
-        # 흔한 부제: "ให้ใช้ประมวลกฎหมายยาเสพติด" 등
+        if _is_promulgation_line(ln):
+            # 공포문 라인은 title 구성에서 제외
+            continue
+        # 부제 후보
         if ("ให้ใช้" in ln) or ("ยาเสพติด" in ln) or ("ประมวลกฎหมาย" in ln):
-            subline = ln if len(ln) > len(subline) else subline
-        # 연도 미탐지시 부제만 있어도 채택
+            if len(ln) > len(subline):
+                subline = ln
         if not subline:
             subline = ln
+        # 연도 추출
+        yp = _extract_year_phrase(ln)
+        if yp:
+            year_phrase = yp
 
     parts = [title]
     if subline and subline not in title:
         parts.append(subline)
-    if yearline and yearline not in title and yearline != subline:
-        parts.append(yearline)
+    if year_phrase and year_phrase not in title and year_phrase != subline:
+        parts.append(year_phrase)
+
     cand = " ".join(parts)
     cand = _thai_to_arabic(cand)
     return " ".join(cand.split()).strip()
@@ -226,7 +258,7 @@ def repair_tree(result: ParseResult) -> Dict[str, Any]:
     result.node_map = {n.node_id: n for n in result.all_nodes}
     return diag
 
-# ───────────────────────────── 조문 시리즈/가중치 ───────────────────────────── #
+# ───────────────────────────── 시리즈/경로 유틸 ───────────────────────────── #
 
 def _article_series_index(leaves: List[Node]) -> Dict[str, int]:
     def main_int(num: Optional[str]) -> int:
@@ -236,7 +268,6 @@ def _article_series_index(leaves: List[Node]) -> Dict[str, int]:
             return int(str(num).split("/")[0])
         except Exception:
             return 10**9
-
     series = 1
     prev = -1
     mapping: Dict[str, int] = {}
@@ -292,11 +323,11 @@ def make_chunks(
     tail_merge_min_chars: int = 200,
 ) -> Tuple[List[Chunk], Dict[str, Any]]:
     """
-    Strict 모드:
+    Strict:
       - headnote/gap 길이 필터 비활성
-      - 모든 정리 후 post-fill로 남은 간극을 orphan_gap으로 보강(공백-only 포함)
-    + 회계(diag): 제거 사유 세분화
-    + 롱 조문 보조분할(옵션) + tail 병합(최소 길이 미만은 앞 part와 병합)
+      - post-fill로 남은 간극 orphan_gap 보강(공백-only 포함)
+    + 회계(diag) 세분화
+    + 롱 조문 분할 + tail 병합(마지막 part가 기준 미만이면 앞 파트와 병합)
     """
     text = result.full_text
     total_len = len(text)
@@ -317,12 +348,12 @@ def make_chunks(
         "split": {
             "enabled": bool(split_long_articles),
             "threshold": int(split_threshold_chars),
-            "series_total_counts": {},   # 예: {"1": 30, "2": 120, "3": 55}
+            "series_total_counts": {},
         },
         "tail_merge": {
             "min_chars": int(tail_merge_min_chars),
             "merged_count": 0,
-            "affected_sections": [],     # section_uid 일부 샘플
+            "affected_sections": [],
         },
     }
 
@@ -337,7 +368,6 @@ def make_chunks(
         p = s
         while p < e:
             q = min(p + split_threshold_chars, e)
-            # 문단 경계(빈 줄) 기준으로 자르되, 너무 짧으면 그냥 강제 컷
             cut = text.rfind("\n\n", p + int(0.6 * split_threshold_chars), q)
             if cut == -1 or cut <= p + 200:
                 cut = q
@@ -350,7 +380,6 @@ def make_chunks(
             return spans
         last_s, last_e = spans[-1]
         if (last_e - last_s) < tail_merge_min_chars:
-            # 이전 파트와 병합
             prev_s, prev_e = spans[-2]
             merged = spans[:-2] + [(prev_s, last_e)]
             diag["tail_merge"]["merged_count"] += 1
@@ -542,7 +571,7 @@ def make_chunks(
         cleaned.append(c)
     chunks = cleaned
 
-    # 동일 (span_start, span_end) 중복 제거
+    # 동일 스팬 dedupe
     seen_span = set()
     dedup1: List[Chunk] = []
     for c in chunks:
@@ -560,12 +589,11 @@ def make_chunks(
     for c in chunks:
         s, e = c.span_start, c.span_end
         if last_end > -1 and s < last_end:
-            s = last_end  # 전방 클립
+            s = last_end
             if e - s <= 0:
                 diag["removals"]["removed_overlap_clip_to_zero"] += 1
                 continue
 
-        # Strict일 때는 headnote/gap/front_matter 길이 필터 완전 비활성화
         if not strict_lossless:
             if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
                 thr = min_headnote_len if c.meta.get("type") == "headnote" else min_gap_len
@@ -578,10 +606,10 @@ def make_chunks(
         final.append(c)
         last_end = e
 
-    # headnote 최종 개수 기록
+    # headnote 최종 개수
     diag["final_headnote_count"] = sum(1 for c in final if c.meta.get("type") == "headnote")
 
-    # ── Strict 전용 post-fill ── #
+    # Strict post-fill
     if strict_lossless:
         ivs2 = _compute_union([(c.span_start, c.span_end) for c in final])
         post_gaps: List[Tuple[int, int]] = []
@@ -597,7 +625,7 @@ def make_chunks(
             if e <= s:
                 diag["removals"]["removed_invalid_span"] += 1
                 continue
-            frag = text[s:e]   # 공백-only라도 포함
+            frag = text[s:e]
             crumbs = _find_path_at_offset(result, s)
             meta = {
                 "type": "orphan_gap",

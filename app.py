@@ -3,7 +3,6 @@ import io
 import json
 import time
 from typing import List, Tuple, Dict, Any, Optional
-import re
 
 import streamlit as st
 
@@ -59,9 +58,9 @@ def _ensure_state():
         # Strict 무손실(coverage=1.0 보장 의도)
         "strict_lossless": True,
         # 롱 조문 보조분할 + tail 병합
-        "split_long_articles": True,          # 요청에 따라 ON으로 기본 변경
-        "split_threshold_chars": 1500,        # 컷 1500
-        "tail_merge_min_chars": 200,          # tail 병합 200자
+        "split_long_articles": True,     # ON
+        "split_threshold_chars": 1500,
+        "tail_merge_min_chars": 200,
         # 탐색기 옵션
         "filter_query": "",
         "show_text_preview_chars": 260,
@@ -85,7 +84,6 @@ def _group_chunks(chunks: List[Chunk]) -> Dict[str, List[Chunk]]:
     for c in chunks:
         key = c.meta.get("section_uid") or c.meta.get("section_label") or c.meta.get("type", "unknown")
         groups.setdefault(key, []).append(c)
-    # 정렬: 시작 오프셋 기준
     for k in groups:
         groups[k].sort(key=lambda x: (x.span_start, x.span_end))
     return dict(sorted(groups.items(), key=lambda kv: (kv[1][0].span_start if kv[1] else 10**12)))
@@ -102,7 +100,6 @@ def _chunk_to_json(c: Chunk) -> Dict[str, Any]:
 def _render_json_explorer(chunks: List[Chunk]):
     st.subheader("결과 탐색기 (JSON 노드별 접기/펼치기)")
 
-    # 필터/옵션 바
     qcol1, qcol2, qcol3 = st.columns([2,1,1])
     with qcol1:
         st.session_state["filter_query"] = st.text_input("필터(섹션/메타/텍스트에 포함되는 키워드)", value=st.session_state["filter_query"])
@@ -114,9 +111,8 @@ def _render_json_explorer(chunks: List[Chunk]):
     groups = _group_chunks(chunks)
     q = (st.session_state["filter_query"] or "").strip()
 
-    shown = 0
     for gi, (gkey, items) in enumerate(groups.items(), 1):
-        # 그룹 헤더 구성
+        # 그룹 헤더 요약
         types = {}
         for x in items:
             t = x.meta.get("type", "article")
@@ -130,7 +126,6 @@ def _render_json_explorer(chunks: List[Chunk]):
             txt = f"{gkey} {type_line} " + " ".join(x.meta.get("section_label","") for x in items)
             if q.lower() in txt.lower():
                 return True
-            # 텍스트에서도 일부 검색(간단, 코스트 제한)
             for x in items[:3]:
                 if q.lower() in x.text.lower():
                     return True
@@ -144,14 +139,16 @@ def _render_json_explorer(chunks: List[Chunk]):
             for ci, c in enumerate(items, 1):
                 meta = c.meta.copy()
                 preview = (c.text[:int(st.session_state["show_text_preview_chars"])] + ("…" if len(c.text) > int(st.session_state["show_text_preview_chars"]) else ""))
-                # 서브 익스팬더
                 with st.expander(f"#{ci:02d} {meta.get('section_label','')}  ·  {meta.get('type','article')}  ·  span={c.span_start}:{c.span_end}", expanded=False):
                     cols = st.columns([3,1])
                     with cols[0]:
-                        st.markdown(f"<div class='kpi'>series_index: {meta.get('series_index','1')}</div>"
-                                    f"<div class='kpi'>series_total: {meta.get('series_total', meta.get('part','1'))}</div>"
-                                    f"<div class='kpi'>retrieval_weight: {meta.get('retrieval_weight','')}</div>"
-                                    f"<div class='kpi muted'>doc_type: {meta.get('doc_type','')}</div>", unsafe_allow_html=True)
+                        st.markdown(
+                            f"<div class='kpi'>series_index: {meta.get('series_index','1')}</div>"
+                            f"<div class='kpi'>series_total: {meta.get('series_total', meta.get('part','1'))}</div>"
+                            f"<div class='kpi'>retrieval_weight: {meta.get('retrieval_weight','')}</div>"
+                            f"<div class='kpi muted'>doc_type: {meta.get('doc_type','')}</div>",
+                            unsafe_allow_html=True
+                        )
                         st.json(_chunk_to_json(c))
                     with cols[1]:
                         st.caption("텍스트 미리보기")
@@ -328,10 +325,8 @@ def main():
                                    mime="application/zip", key="dl-zip-top")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # JSON 기반 노드 탐색기
         _render_json_explorer(st.session_state["chunks"])
 
-        # 검증 경고
         if st.session_state["issues"]:
             st.caption(f"검증 경고: {len(st.session_state['issues'])}건 (REPORT.json에 상세 기록됨)")
     else:

@@ -166,11 +166,19 @@ def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
                  "series_index": c.meta.get("series_index","1"),
                  "series_total": c.meta.get("series_total","1"),
                  "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
+
+    # 리포트 헤더용 시리즈 요약(실제 청크 기준)
+    split_summary = {
+        "series_total_counts": dict(by_series_total),  # 예: {"1": 110, "2": 80, "3": 28}
+        "series_index_counts": dict(Counter(c.meta.get("series_index","1") for c in arts))
+    }
+
     return {"count": len(arts),
             "length_stats_chars": sizes,
             "length_histogram": hist,
             "series_counts": dict(by_series),
             "series_total_counts": dict(by_series_total),
+            "split_summary": split_summary,
             "top_shortest": shortest,
             "top_longest": longest}
 
@@ -211,6 +219,8 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
     split_diag = mk_diag.get("split", {})
     tail_merge = mk_diag.get("tail_merge", {})
 
+    article_stats = _article_size_stats(chunks)
+
     report = {
         "source_file": source_file,
         "law_name": law_name,
@@ -235,7 +245,8 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
             "source_article_count": _count_articles_in_source(full),
             "chunk_article_count": sum(1 for c in chunks if c.meta.get("type","article")=="article")
         },
-        "article_size_stats": _article_size_stats(chunks),
+        # 확장된 조문 통계(시리즈 요약 포함)
+        "article_size_stats": article_stats,
         "pipeline_accounting": {
             "headnote": {
                 "candidates": headnote_candidates,
