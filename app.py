@@ -8,11 +8,16 @@ import streamlit as st
 
 # 패키지 레이아웃(권장)
 from parser_core.parser import detect_doc_type, parse_document
-from parser_core.postprocess import validate_tree, make_chunks, guess_law_name
+from parser_core.postprocess import (
+    validate_tree,
+    make_chunks,
+    guess_law_name,
+    repair_tree,  # ⬅️ 트리 수복
+)
 from parser_core.schema import ParseResult, Node, Chunk
 from exporters import writers as wr
 
-APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
+APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + tree-repair + debug)"
 
 def _inject_css():
     st.markdown(
@@ -49,6 +54,9 @@ def _ensure_state():
         # Strict 무손실(coverage=1.0 보장 의도)
         "strict_lossless": True,
         "show_raw": False,
+        # ⬇️ A단계: 롱 조문 보조분할(기본 OFF)
+        "split_long_articles": False,
+        "split_threshold_chars": 1800,
     }.items():
         st.session_state.setdefault(k, v)
 
@@ -68,7 +76,7 @@ def main():
     _ensure_state()
 
     st.title(APP_TITLE)
-    st.caption("Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
+    st.caption("Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + tree-repair + detailed REPORT.json")
 
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
 
@@ -88,11 +96,15 @@ def main():
         st.session_state["include_headnotes"] = st.checkbox("headnote 포함", value=st.session_state["include_headnotes"])
     with oc3:
         st.session_state["include_gap_fallback"] = st.checkbox("gap-sweeper 포함", value=st.session_state["include_gap_fallback"])
-    sc1, sc2 = st.columns(2)
+
+    sc1, sc2, sc3 = st.columns(3)
     with sc1:
         st.session_state["min_headnote_len"] = st.number_input("headnote 최소 길이(문자)", min_value=0, max_value=400, value=st.session_state["min_headnote_len"])
     with sc2:
         st.session_state["min_gap_len"] = st.number_input("gap 보강 최소 길이(문자)", min_value=0, max_value=400, value=st.session_state["min_gap_len"])
+    with sc3:
+        st.session_state["split_long_articles"] = st.checkbox("롱 조문 보조분할(문단 경계)", value=st.session_state["split_long_articles"])
+        st.session_state["split_threshold_chars"] = st.number_input("보조분할 임계값(문자)", min_value=600, max_value=6000, value=st.session_state["split_threshold_chars"], step=100)
 
     parse_clicked = st.button("파싱")
 
@@ -123,8 +135,10 @@ def main():
         result: ParseResult = parse_document(text, doc_type=doc_type)
         t3 = time.time()
 
-        # 3) validate
-        issues = validate_tree(result)
+        # 3) (A단계) tree-repair 이전/이후 이슈 계측
+        issues_before = validate_tree(result)
+        rep_diag = repair_tree(result)  # ← 부모 span 확장/축소 + 경계 정규화 (무손실)
+        issues_after = validate_tree(result)
         t4 = time.time()
 
         # 4) chunks (+ diag)
@@ -141,6 +155,9 @@ def main():
             min_headnote_len=int(st.session_state["min_headnote_len"]),
             min_gap_len=int(st.session_state["min_gap_len"]),
             strict_lossless=bool(st.session_state["strict_lossless"]),
+            # ⬇️ 보조분할 옵션
+            split_long_articles=bool(st.session_state["split_long_articles"]),
+            split_threshold_chars=int(st.session_state["split_threshold_chars"]),
         )
         t5 = time.time()
 
@@ -149,7 +166,7 @@ def main():
             "law_name": law_name,
             "result": result,
             "chunks": chunks,
-            "issues": issues,
+            "issues": issues_after,
             "parsed": True,
         })
 
@@ -163,14 +180,21 @@ def main():
             "min_headnote_len": int(st.session_state["min_headnote_len"]),
             "min_gap_len": int(st.session_state["min_gap_len"]),
             "strict_lossless": bool(st.session_state["strict_lossless"]),
+            "split_long_articles": bool(st.session_state["split_long_articles"]),
+            "split_threshold_chars": int(st.session_state["split_threshold_chars"]),
         }
         st.session_state["debug"] = {
             "timings_sec": {
                 "detect": round(t2 - t1, 6),
                 "parse": round(t3 - t2, 6),
-                "validate": round(t4 - t3, 6),
+                "tree_repair": round(t4 - t3, 6),
                 "make_chunks": round(t5 - t4, 6),
                 "total": round(t5 - t0, 6),
+            },
+            "tree_repair": {
+                "issues_before": len(issues_before),
+                "issues_after": len(issues_after),
+                **rep_diag,
             },
             "make_chunks_diag": mk_diag or {},
         }

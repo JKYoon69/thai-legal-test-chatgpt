@@ -41,7 +41,7 @@ def make_zip_bundle(
     buf.seek(0)
     return buf
 
-# ── helpers ── #
+# ───────────────────────────── helpers ───────────────────────────── #
 
 def _span_union(chunks: List[Chunk]) -> Tuple[int, List[Tuple[int,int]]]:
     ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
@@ -123,7 +123,7 @@ def _largest_gaps(full_text: str, chunks: List[Chunk], topn: int = 5) -> List[Di
     gaps_sorted = sorted(gaps, key=lambda g: (g[1]-g[0]), reverse=True)[:topn]
     return [{"span": [s,e], "len": e-s, "preview": snip(s,e)} for s,e in gaps_sorted]
 
-# ── 조문 크기 통계 ── #
+# ───────────────────────────── 조문 크기 통계 ───────────────────────────── #
 
 def _percentiles(vals: List[int]) -> Dict[str, float]:
     if not vals: return {"p25":0,"p50":0,"p75":0,"min":0,"max":0,"mean":0.0}
@@ -151,12 +151,20 @@ def _article_size_stats(chunks: List[Chunk]) -> Dict[str, Any]:
     hist = _histogram(lens)
     by_series: Counter = Counter(c.meta.get("series","1") for c in arts)
     arts_sorted = sorted(arts, key=lambda c: len(c.text))
-    shortest = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[:5]]
-    longest  = [{"section_label": c.meta.get("section_label",""), "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
+    def bc(c: Chunk) -> str:
+        return " / ".join(c.breadcrumbs or [])
+    shortest = [{"section_label": c.meta.get("section_label",""),
+                 "breadcrumbs": bc(c),
+                 "section_uid": c.meta.get("section_uid",""),
+                 "len": len(c.text)} for c in arts_sorted[:5]]
+    longest  = [{"section_label": c.meta.get("section_label",""),
+                 "breadcrumbs": bc(c),
+                 "section_uid": c.meta.get("section_uid",""),
+                 "len": len(c.text)} for c in arts_sorted[-5:]][::-1]
     return {"count": len(arts), "length_stats_chars": sizes, "length_histogram": hist,
             "series_counts": dict(by_series), "top_shortest": shortest, "top_longest": longest}
 
-# ── REPORT ── #
+# ───────────────────────────── REPORT ───────────────────────────── #
 
 def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_file: str,
                       law_name: str, run_config: Dict[str, Any] | None = None,
@@ -180,14 +188,16 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
     mk_diag = (debug or {}).get("make_chunks_diag", {}) if debug else {}
     strict_post_fill = mk_diag.get("strict_post_fill", {"enabled": False, "filled_gaps": 0, "total_chars": 0, "spans": []})
 
-    # 회계(제거 사유) 정리
+    # 파이프라인 회계(제거 사유)
     removals = mk_diag.get("removals", {})
     headnote_candidates = mk_diag.get("headnote_candidates", 0)
     headnote_after_filter = mk_diag.get("headnote_after_filter", 0)
     final_headnote_count = mk_diag.get("final_headnote_count", 0)
     removed_total = sum(removals.values()) if isinstance(removals, dict) else 0
-    # 합계 검증(참고용): 후보 → (필터 통과) → (최종)
-    accounting_ok = (final_headnote_count <= headnote_after_filter)  # 최종 단계에서 dedupe/클립으로 더 빠질 수 있음
+    accounting_ok = (final_headnote_count <= headnote_after_filter)
+
+    # 트리 수복 진단
+    tree_repair = (debug or {}).get("tree_repair", {}) if debug else {}
 
     report = {
         "source_file": source_file,
@@ -195,6 +205,7 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
         "doc_type": parse_result.doc_type,
         "run_config": run_config or {},
         "tree": _tree_stats(parse_result),
+        "tree_repair": tree_repair,  # ⬅️ before/after/조정량 등
         "chunks": {
             "count": len(chunks),
             "type_counts": dict(type_counts),
@@ -213,7 +224,6 @@ def make_debug_report(parse_result: ParseResult, chunks: List[Chunk], source_fil
             "chunk_article_count": sum(1 for c in chunks if c.meta.get("type","article")=="article")
         },
         "article_size_stats": _article_size_stats(chunks),
-        # ── 새 섹션: 파이프라인 회계 ── #
         "pipeline_accounting": {
             "headnote": {
                 "candidates": headnote_candidates,
