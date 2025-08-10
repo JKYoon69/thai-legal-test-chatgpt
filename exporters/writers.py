@@ -8,10 +8,8 @@ from datetime import datetime
 import re
 from collections import Counter
 
-from schema import ParseResult, Chunk
-from rules_th import normalize_text
-
-# ───────────────────────────── Export ───────────────────────────── #
+from parser_core.schema import ParseResult, Chunk
+from parser_core.rules_th import normalize_text
 
 def to_jsonl(chunks: List[Chunk]) -> str:
     lines = []
@@ -137,8 +135,6 @@ def _largest_gaps(full_text: str, chunks: List[Chunk], topn: int = 5) -> List[Di
     gaps_sorted = sorted(gaps, key=lambda g: (g[1]-g[0]), reverse=True)[:topn]
     return [{"span": [s,e], "len": e-s, "preview": snip(s,e)} for s,e in gaps_sorted]
 
-# ───────────────────────────── REPORT ───────────────────────────── #
-
 def make_debug_report(
     parse_result: ParseResult,
     chunks: List[Chunk],
@@ -152,7 +148,6 @@ def make_debug_report(
     src_len = len(full)
     coverage = (union_len / src_len) if src_len else 0.0
 
-    # integrity: overlap & text match
     integ = _overlap_diagnostics(chunks)
     mismatches = 0
     for c in chunks:
@@ -160,7 +155,6 @@ def make_debug_report(
             mismatches += 1
     integ["text_mismatches"] = mismatches
 
-    # types
     type_counts = Counter(c.meta.get("type","article") for c in chunks)
     type_sizes = Counter()
     for c in chunks:

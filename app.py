@@ -7,25 +7,23 @@ from typing import List
 import streamlit as st
 
 # ─────────────────────────────────────────────
-# Import fallbacks: try package path, then flat files
+# Always prefer the package layout (parser_core/*)
+# Fallback to flat files only if needed.
 # ─────────────────────────────────────────────
 try:
-    # 패키지 구조: parser_core/*
     from parser_core.parser import detect_doc_type, parse_document
     from parser_core.postprocess import validate_tree, make_chunks, guess_law_name
     from parser_core.schema import ParseResult, Node, Chunk
-    import exporters.writers as wr
+    from exporters import writers as wr
     IMPORT_FLAVOR = "parser_core/*"
 except Exception:
     try:
-        # 평면 파일 구조: 같은 디렉토리의 *.py
         from parser import detect_doc_type, parse_document
         from postprocess import validate_tree, make_chunks, guess_law_name
         from schema import ParseResult, Node, Chunk
         import writers as wr
         IMPORT_FLAVOR = "flat *.py"
     except Exception as e:
-        # 에러 메시지를 명확히
         raise ImportError(
             "Cannot import parsing modules. Expected either:\n"
             "  - parser_core/{parser,postprocess,schema}.py + exporters/writers.py\n"
@@ -34,8 +32,6 @@ except Exception:
         ) from e
 
 APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
-
-# ───────────────────────────────── UI Helpers ───────────────────────────────── #
 
 def _inject_css():
     st.markdown(
@@ -62,7 +58,7 @@ def _ensure_state():
         "chunks": [],
         "issues": [],
         "mode": "article_only",
-        # REPORT에 기록되는 손실 방지/노이즈 억제 옵션
+        # lossless / noise-control (also saved into REPORT.run_config)
         "include_front_matter": True,
         "include_headnotes": True,
         "include_gap_fallback": True,
@@ -89,7 +85,7 @@ def main():
     _ensure_state()
 
     st.title(APP_TITLE)
-    st.caption(f"Imports: **{IMPORT_FLAVOR}**  ·  Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
+    st.caption(f"Imports: **{IMPORT_FLAVOR}** · Upload UTF-8 Thai legal .txt → [파싱] → lossless chunks + detailed REPORT.json")
 
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
 
@@ -99,7 +95,7 @@ def main():
     with colB:
         st.session_state["show_raw"] = st.checkbox("원문(raw) 보기", value=st.session_state["show_raw"])
     with colC:
-        st.write("")  # spacer
+        st.write("")
 
     st.markdown("**손실 방지 / 노이즈 억제 옵션 (REPORT에 기록됩니다)**")
     oc1, oc2, oc3 = st.columns(3)
@@ -173,7 +169,7 @@ def main():
             "parsed": True,
         })
 
-        # REPORT에 기록할 실행 설정/디버그
+        # REPORT 설정/디버그
         st.session_state["run_config"] = {
             "mode": st.session_state["mode"],
             "include_front_matter": st.session_state["include_front_matter"],
@@ -229,7 +225,6 @@ def main():
                                    mime="application/zip", key="dl-zip-top")
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # 원문 미리보기 (간단)
         if st.session_state["show_raw"]:
             st.subheader("원문 미리보기")
             st.markdown(f"<div class='code-like'>{st.session_state['text'][:2000]}</div>", unsafe_allow_html=True)

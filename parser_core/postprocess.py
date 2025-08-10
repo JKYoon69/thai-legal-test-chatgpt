@@ -2,18 +2,17 @@
 from __future__ import annotations
 from typing import List, Optional, Tuple, Dict
 
-from schema import ParseResult, Node, Chunk
-from rules_th import normalize_text
+from .schema import ParseResult, Node, Chunk
+from .rules_th import normalize_text
 
-# 안전 상한: 현 단계는 사실상 분할 비활성 (조문이 길더라도 같은 조문 내에서만 part)
+# 조문 분할 상한(사실상 비활성)
 MAX_NODE_CHARS = 10000
 
-# ───────────────────────────── 기본 검증 ───────────────────────────── #
+# ───────────────────────────── 검증 ───────────────────────────── #
 
 def validate_tree(result: ParseResult) -> List[str]:
     issues: List[str] = []
 
-    # 형제 간 스팬 클램프 점검
     def _check(n: Node):
         for i, c in enumerate(n.children):
             if i + 1 < len(n.children):
@@ -23,13 +22,11 @@ def validate_tree(result: ParseResult) -> List[str]:
             _check(c)
     _check(result.root)
 
-    # 빈 노드
     for n in result.all_nodes:
         if n is result.root or n.label == "front_matter":
             continue
         if n.text is None or len(n.text.strip()) < 1:
             issues.append(f"Empty node: {n.label} {n.num}")
-
     return issues
 
 # ───────────────────────────── 유틸 ───────────────────────────── #
@@ -72,7 +69,6 @@ def _compute_union(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return [(s, e) for s, e in merged]
 
 def _subtract_intervals(outer: Tuple[int, int], covered: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """outer [S,E)에서 covered(합집합 가정)를 뺀 나머지 구간들 반환"""
     S, E = outer
     res: List[Tuple[int, int]] = []
     cur = S
@@ -89,9 +85,6 @@ def _subtract_intervals(outer: Tuple[int, int], covered: List[Tuple[int, int]]) 
     return [(s, e) for (s, e) in res if e > s]
 
 def guess_law_name(text: str) -> Optional[str]:
-    """
-    타이틀 라인 + 다음 보조 라인 결합. 'ประมวลกฎหมาย'도 다음 줄에서 허용.
-    """
     norm = normalize_text(text)
     lines = [ln.strip() for ln in norm.splitlines()[:60] if ln.strip()]
     title = None
@@ -106,10 +99,6 @@ def guess_law_name(text: str) -> Optional[str]:
     return title
 
 def _article_series_index(leaves: List[Node]) -> Dict[str, int]:
-    """
-    번호가 다시 1부터 시작하는 시점마다 series를 +1. series는 1부터 시작.
-    key: leaf.node_id -> series_no
-    """
     def main_int(num: Optional[str]) -> int:
         if not num:
             return 10**9
@@ -168,16 +157,10 @@ def make_chunks(
     min_gap_len: int = 24,
 ) -> List[Chunk]:
     """
-    단계 1: 조문 단위 1:1 + 손실 방지 보강 + 중복/겹침 방지
-      - article: 모든 조문(및 ข้อ) → 청크화
-      - front_matter: 첫 헤더 전 텍스트(옵션)
-      - headnotes: 지정된 상위 헤더 레벨에서, 자식 합집합을 뺀 머리말(옵션)
-      - gap-sweeper: 전역 간극을 orphan_gap으로 보강(옵션)
-      - 마지막으로 dedupe/clip: 동일 구간 중복 제거 + 겹치는 경우 뒤 청크를 전방 클립
+    조문 1:1 + front_matter/headnote/gap 보강(옵션) + 중복/겹침 억제
     """
     text = result.full_text
     total_len = len(text)
-
     chunks: List[Chunk] = []
 
     # 1) article leaves
@@ -191,7 +174,6 @@ def make_chunks(
         crumbs = _breadcrumbs(leaf, result)
         section_uid = "/".join(crumbs) if crumbs else section_label
 
-        # 과대 조문 분할(같은 조문 내에서만)
         spans = [(leaf.span_start, leaf.span_end)]
         new_spans: List[Tuple[int, int]] = []
         for s, e in spans:
@@ -262,7 +244,7 @@ def make_chunks(
                     )
                 break
 
-    # 3) headnotes (상위 헤더 안의 머리말) — 레벨 제한
+    # 3) headnotes (레벨 제한 + 최소 길이)
     if include_headnotes:
         allowed = set(allowed_headnote_levels)
         def walk(parent: Node):
@@ -300,7 +282,7 @@ def make_chunks(
                 walk(c)
         walk(result.root)
 
-    # 4) gap-sweeper — 전역 간극 보강(짧은 gap은 버림)
+    # 4) gap-sweeper (짧은 gap은 무시)
     if include_gap_fallback:
         ivs = _compute_union([(c.span_start, c.span_end) for c in chunks])
         gaps: List[Tuple[int, int]] = []
@@ -337,50 +319,41 @@ def make_chunks(
                     )
                 )
 
-    # ── 정리 단계: 정렬 → 무결성 보정(텍스트 동기화) → 중복/겹침 억제 ── #
-
-    # (a) 정렬
+    # ── 정리: 정렬 → 동기화 → 동일구간 dedupe → 연속 겹침 클립 ── #
     chunks.sort(key=lambda c: (c.span_start, c.span_end))
 
-    # (b) 텍스트-스팬 동기화 + 공백청크 제거
     cleaned: List[Chunk] = []
     for c in chunks:
         s, e = c.span_start, c.span_end
         if s is None or e is None or e <= s:
             continue
-        c.text = text[s:e]  # 항상 소스에서 재생성 (불일치 방지)
+        c.text = text[s:e]  # 항상 소스 기준 재생성
         if c.text.strip() == "":
             continue
         cleaned.append(c)
     chunks = cleaned
 
-    # (c) 동일구간 중복 제거 (동일 (span_start, span_end))
     seen_span = set()
     dedup1: List[Chunk] = []
     for c in chunks:
         key = (c.span_start, c.span_end)
         if key in seen_span:
-            # 우선순위: article > appendix > headnote > front_matter > orphan_gap
-            # 이미 같은 구간이 있다면, 더 낮은 우선순위는 버림
             continue
         seen_span.add(key)
         dedup1.append(c)
     chunks = dedup1
 
-    # (d) 연속 겹침 방지: 앞 청크와 겹치면 뒤 청크의 시작을 앞 청크 끝으로 클립
     final: List[Chunk] = []
     last_end = -1
     for c in chunks:
         s, e = c.span_start, c.span_end
         if last_end > -1 and s < last_end:
-            s = last_end
+            s = last_end  # 뒤 청크 전방 클립
         if e - s <= 0:
             continue
-        # 최소 의미 길이 미만이면 버림(머리말/갭에서만 적용)
         if c.meta.get("type") in ("headnote", "orphan_gap", "front_matter"):
             if (e - s) < min( min_headnote_len if c.meta.get("type")=="headnote" else min_gap_len, 8):
                 continue
-        # 반영
         c.span_start, c.span_end = s, e
         c.text = text[s:e]
         final.append(c)
