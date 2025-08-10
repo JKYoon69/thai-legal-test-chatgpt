@@ -6,7 +6,11 @@ from typing import List, Optional, Tuple
 import streamlit as st
 
 from parser_core.parser import detect_doc_type, parse_document
-from parser_core.postprocess import validate_tree, make_chunks, guess_law_name
+from parser_core.postprocess import (
+    validate_tree,
+    make_chunks,
+    guess_law_name,
+)
 from parser_core.schema import ParseResult, Node, Chunk
 from exporters.writers import to_jsonl, make_zip_bundle, make_debug_report
 
@@ -32,7 +36,6 @@ def _inject_css():
           .depth-4 .tree-label{ background: rgba(0,0,0,.03); }
           .indent { height: 1px; width: var(--indent, 0px); }
           .badge { background: #e7f5ff; border: 1px solid #d0ebff; padding: .05rem .35rem; border-radius: .5rem; font-size: .72rem; }
-          /* dark mode friendly */
           @media (prefers-color-scheme: dark){
             .badge { background: rgba(56, 139, 253,.15); border-color: rgba(56,139,253,.35); }
             .depth-1 .tree-label{ background: rgba(255,255,255,.06); }
@@ -56,7 +59,13 @@ def _ensure_state():
         "chunks": [],
         "issues": [],
         "sel_id": None,
-        "mode": "article±1",
+        "mode": "article_only",
+        # toggles
+        "include_front_matter": True,
+        "include_headnotes": True,
+        "include_gap_fallback": True,
+        "min_headnote_len": 12,
+        "min_gap_len": 10,
     }.items():
         st.session_state.setdefault(k, v)
 
@@ -69,7 +78,6 @@ def _flatten_with_depth(nodes: List[Node], depth: int = 0) -> List[Tuple[Node, i
     return out
 
 def render_tree_and_select(result: ParseResult):
-    """Flat tree with indentation + per-row '보기' button. Stores selection in session_state['sel_id']"""
     st.subheader("문서 트리")
     if not result or not result.root.children:
         st.info("트리에 표시할 노드가 없습니다.")
@@ -77,11 +85,9 @@ def render_tree_and_select(result: ParseResult):
 
     flat = _flatten_with_depth(result.root.children, depth=0)
     for n, depth in flat:
-        # indentation width (px)
         indent_px = 14 * depth
         cols = st.columns([1, 5, 1])
         with cols[0]:
-            # visual indent
             st.markdown(f"<div class='indent' style='--indent:{indent_px}px'></div>", unsafe_allow_html=True)
         with cols[1]:
             lbl = f"{(n.label or '')} {('' if not n.num else n.num)}".strip()
@@ -97,7 +103,6 @@ def render_tree_and_select(result: ParseResult):
     st.caption(f"전체 노드: {len(result.all_nodes)}")
 
 def highlight_text(full_text: str, spans: List[tuple]) -> str:
-    """Insert <mark> to highlight non-overlapping spans."""
     if not spans:
         return f"<div class='code-like'>{full_text}</div>"
     html = []
@@ -113,6 +118,17 @@ def highlight_text(full_text: str, spans: List[tuple]) -> str:
         html.append(full_text[last:])
     return f"<div class='code-like'>{''.join(html)}</div>"
 
+def _coverage(chunks: List[Chunk], total_len: int) -> float:
+    ivs = sorted([[c.span_start, c.span_end] for c in chunks], key=lambda x: x[0])
+    merged = []
+    for s, e in ivs:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    covered = sum(e - s for s, e in merged)
+    return (covered / total_len) if total_len else 0.0
+
 # ───────────────────────────────── App ───────────────────────────────── #
 
 def main():
@@ -124,13 +140,34 @@ def main():
 
     # inputs
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
-    st.session_state["mode"] = st.radio(
-        "청크 모드",
-        options=["article_only", "article±1"],
-        index=1 if st.session_state["mode"] == "article±1" else 0,
-        help="조문(มาตรา/ข้อ) 단위로만 자를지, 앞뒤 조문 하나씩 가볍게 합칠지 선택",
-    )
-    show_raw = st.checkbox("원문(raw) 보기", value=False)
+
+    left, right = st.columns(2)
+    with left:
+        st.session_state["mode"] = st.selectbox(
+            "청크 모드",
+            options=["article_only"],  # 현재 단계는 조문 단위 고정
+            index=0,
+            help="현재 단계는 조문 단위 트리 확정(병합/분할 없음)"
+        )
+    with right:
+        show_raw = st.checkbox("원문(raw) 보기", value=False)
+
+    # options for lossless coverage
+    st.markdown("**손실 방지 옵션**")
+    oc1, oc2, oc3 = st.columns(3)
+    with oc1:
+        st.session_state["include_front_matter"] = st.checkbox("front matter 포함", value=st.session_state["include_front_matter"])
+    with oc2:
+        st.session_state["include_headnotes"] = st.checkbox("headnote 포함(상위 헤더 머리말)", value=st.session_state["include_headnotes"])
+    with oc3:
+        st.session_state["include_gap_fallback"] = st.checkbox("gap-sweeper(최종 보강)", value=st.session_state["include_gap_fallback"])
+
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.session_state["min_headnote_len"] = st.number_input("headnote 최소 길이(문자)", min_value=0, max_value=200, value=st.session_state["min_headnote_len"])
+    with sc2:
+        st.session_state["min_gap_len"] = st.number_input("gap 보강 최소 길이(문자)", min_value=0, max_value=200, value=st.session_state["min_gap_len"])
+
     parse_clicked = st.button("파싱")
 
     # load text to state on upload
@@ -142,7 +179,6 @@ def main():
             st.error("파일 인코딩을 UTF-8로 저장해주세요.")
             return
 
-    # Only parse when button clicked
     if parse_clicked:
         if not st.session_state["text"]:
             st.warning("먼저 파일을 업로드하세요.")
@@ -164,6 +200,11 @@ def main():
             mode=mode,
             source_file=source_file,
             law_name=law_name,
+            include_front_matter=st.session_state["include_front_matter"],
+            include_headnotes=st.session_state["include_headnotes"],
+            include_gap_fallback=st.session_state["include_gap_fallback"],
+            min_headnote_len=int(st.session_state["min_headnote_len"]),
+            min_gap_len=int(st.session_state["min_gap_len"]),
         )
 
         # store
@@ -175,17 +216,19 @@ def main():
         st.session_state["parsed"] = True
         st.session_state["sel_id"] = None  # reset selection
 
-    # After parse: show toolbar (exports) at the very top (sticky)
+    # toolbar
     if st.session_state["parsed"]:
+        cov = _coverage(st.session_state["chunks"], len(st.session_state["result"].full_text))
         with st.container():
             st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
-            tcol1, tcol2, tcol3, _ = st.columns([2, 1.2, 1.2, 3])
+            tcol1, tcol2, tcol3, _ = st.columns([2.5, 1.2, 1.2, 3])
             with tcol1:
                 st.write(
                     f"**파일:** {st.session_state['source_file']}  |  "
                     f"**doc_type:** {st.session_state['doc_type']}  |  "
                     f"**law_name:** {st.session_state['law_name'] or 'N/A'}  |  "
-                    f"**chunks:** {len(st.session_state['chunks'])}"
+                    f"**chunks:** {len(st.session_state['chunks'])}  |  "
+                    f"**coverage:** {cov:.6f}"
                 )
             with tcol2:
                 jsonl_bytes = to_jsonl(st.session_state["chunks"]).encode("utf-8")
@@ -213,7 +256,6 @@ def main():
                 )
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # columns: tree (indent), preview with highlight
         col1, col2 = st.columns([1, 2], gap="large")
 
         with col1:

@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 from .schema import ParseResult, Node, Chunk
 from .rules_th import normalize_text
 
-# 단계 1: 조문 단위 확보에 집중 — 분할/병합 비활성화(안전 상한만 넉넉히)
-MAX_NODE_CHARS = 10000  # 현 샘플의 최대 조문 3,382자 → 분할 발생하지 않도록 충분히 크게
+# 안전치: 현재 단계는 조문 단위 유지, 과대 조문 분할은 사실상 비활성(넉넉한 상한)
+MAX_NODE_CHARS = 10000
+
+# ───────────────────────────── 기본 검증 ───────────────────────────── #
 
 def validate_tree(result: ParseResult) -> List[str]:
     issues: List[str] = []
 
-    # 1) 형제 간 스팬이 겹치지 않는지 점검
     def _check(n: Node):
         for i, c in enumerate(n.children):
             if i + 1 < len(n.children):
@@ -21,7 +22,6 @@ def validate_tree(result: ParseResult) -> List[str]:
             _check(c)
     _check(result.root)
 
-    # 2) 빈 노드 점검(front_matter 제외)
     for n in result.all_nodes:
         if n is result.root or n.label == "front_matter":
             continue
@@ -30,21 +30,20 @@ def validate_tree(result: ParseResult) -> List[str]:
 
     return issues
 
-def _is_leaf(n: Node) -> bool:
-    # 조문/ข้อ를 리프 취급 (하위 노드가 있더라도 현재 단계에선 조문 단위만 청크로 삼음)
+# ───────────────────────────── 유틸 ───────────────────────────── #
+
+def _is_article_leaf(n: Node) -> bool:
     return n.label in ("มาตรา", "ข้อ")
 
-def _gather_leaves(root: Node) -> List[Node]:
+def _collect_article_leaves(root: Node) -> List[Node]:
     leaves: List[Node] = []
     stack = list(root.children)
     while stack:
         n = stack.pop(0)
-        if _is_leaf(n):
+        if _is_article_leaf(n):
             leaves.append(n)
-        # 계속 내려가되, 조문이 아닌 상위 노드는 탐색만
         for c in n.children:
             stack.append(c)
-    # 문서 순서 보장
     leaves.sort(key=lambda x: x.span_start)
     return leaves
 
@@ -58,10 +57,36 @@ def _breadcrumbs(n: Node, result: ParseResult) -> List[str]:
             break
     return list(reversed(crumbs))
 
+def _compute_union(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    if not spans:
+        return []
+    spans_sorted = sorted(spans, key=lambda x: x[0])
+    merged: List[List[int]] = []
+    for s, e in spans_sorted:
+        if not merged or s > merged[-1][1]:
+            merged.append([s, e])
+        else:
+            merged[-1][1] = max(merged[-1][1], e)
+    return [(s, e) for s, e in merged]
+
+def _subtract_intervals(outer: Tuple[int, int], covered: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """outer [S,E)에서 covered(합집합 가정)를 뺀 나머지 구간들 반환"""
+    S, E = outer
+    res: List[Tuple[int, int]] = []
+    cur = S
+    for s, e in covered:
+        if e <= cur:
+            continue
+        if s > cur:
+            res.append((cur, min(s, E)))
+        cur = max(cur, e)
+        if cur >= E:
+            break
+    if cur < E:
+        res.append((cur, E))
+    return [(s, e) for (s, e) in res if e > s]
+
 def guess_law_name(text: str) -> Optional[str]:
-    """
-    타이틀 라인 + 다음 보조 라인(있으면) 결합
-    """
     norm = normalize_text(text)
     lines = [ln.strip() for ln in norm.splitlines()[:60] if ln.strip()]
     title = None
@@ -69,76 +94,245 @@ def guess_law_name(text: str) -> Optional[str]:
         if ("พระราชบัญญัติ" in ln) or ("ประมวลกฎหมาย" in ln):
             title = ln
             if i + 1 < len(lines) and len(lines[i + 1]) <= 60 and (
-                "ภาค" in lines[i+1] or "ลักษณะ" in lines[i+1] or "พ.ศ." in lines[i+1] or "ฉบับ" in lines[i+1]
+                "ภาค" in lines[i+1] or "ลักษณะ" in lines[i+1] or "พ.ศ." in lines[i+1] or "ฉบับ" in lines[i+1] or "ประมวลกฎหมาย" in lines[i+1]
             ):
                 title = f"{title} / {lines[i+1]}"
             break
     return title
 
-def _split_long_article(text: str, start: int, limit: int) -> List[Tuple[int, int]]:
+def _article_series_index(leaves: List[Node]) -> Dict[str, int]:
     """
-    조문이 limit을 넘는 드문 경우를 대비한 안전 분할(문단 경계 우선).
-    기본적으로 현 문서에서는 분할이 발생하지 않도록 limit을 크게 둠.
+    번호가 다시 1부터 시작하는 시점마다 series를 +1. 
+    series는 1부터 시작. key: leaf.node_id -> series_no
     """
-    if len(text) <= limit:
-        return [(start, start + len(text))]
+    def main_int(num: Optional[str]) -> int:
+        if not num:
+            return 10**9  # 안전
+        try:
+            return int(str(num).split("/")[0])
+        except Exception:
+            return 10**9
 
-    parts: List[Tuple[int, int]] = []
-    s = 0
-    while s < len(text):
-        e = min(s + limit, len(text))
-        # 문단 경계(\n\n)로 당겨서 자르기
-        cut = text.rfind("\n\n", s, e)
-        if cut != -1 and cut > s + 200:  # 최소 200자 확보 후 자르기
-            e = cut + 2
-        parts.append((start + s, start + e))
-        s = e
-    return parts
+    series = 1
+    prev = -1
+    mapping: Dict[str, int] = {}
+    for lf in leaves:
+        cur = main_int(lf.num)
+        if prev != -1 and cur < prev:
+            series += 1
+        mapping[lf.node_id] = series
+        prev = cur
+    return mapping
+
+def _find_path_at_offset(result: ParseResult, offset: int) -> List[str]:
+    """offset을 포함하는 가장 깊은 노드까지의 breadcrumbs 추정"""
+    path: List[str] = []
+    def descend(n: Node):
+        nonlocal path
+        for c in n.children:
+            if c.span_start <= offset < c.span_end:
+                label = f"{c.label or ''}{(' ' + c.num) if c.num else ''}".strip()
+                if label:
+                    path.append(label)
+                descend(c)
+                break
+    descend(result.root)
+    return path
+
+def _retrieval_weight_for(type_: str) -> float:
+    return {
+        "article": 1.0,
+        "appendix": 0.8,
+        "headnote": 0.5,
+        "front_matter": 0.3,
+        "orphan_gap": 0.2,
+    }.get(type_, 0.5)
+
+# ───────────────────────────── 청크 생성 ───────────────────────────── #
 
 def make_chunks(
     result: ParseResult,
     mode: str = "article_only",
     source_file: Optional[str] = None,
     law_name: Optional[str] = None,
+    *,
+    include_front_matter: bool = True,
+    include_headnotes: bool = True,
+    include_gap_fallback: bool = True,
+    min_headnote_len: int = 12,
+    min_gap_len: int = 10,
 ) -> List[Chunk]:
     """
-    단계 1: '조문 단위' 청크를 1:1로 생성 (필요 시 같은 조문 안에서만 part 분할)
-    - 절대 다른 조문끼리 병합하지 않음
-    - 커버리지 100%에 최대한 근접(≈99%)하도록 설계
+    단계 1: 조문 단위 1:1 + 손실 방지 보강
+      - article: 모든 조문(및 ข้อ)을 그대로 청크화
+      - front_matter: 첫 헤더 전 텍스트를 청크화(옵션)
+      - headnotes: 상위 헤더(ภาค/ลักษณะ/หมวด/ส่วน/บท) 본문 중 자식 스팬을 제외하고 남는 머리말 구간을 청크화(옵션)
+      - gap-sweeper: 전역 스팬 합집합으로도 남는 간극을 orphan_gap으로 보강(옵션)
     """
-    leaves = _gather_leaves(result.root)
+    text = result.full_text
+    total_len = len(text)
+
     chunks: List[Chunk] = []
 
+    # 1) article leaves
+    leaves = _collect_article_leaves(result.root)
+    series_map = _article_series_index(leaves)
+
+    article_index = 0
     for leaf in leaves:
+        article_index += 1
         section_label = f"{leaf.label} {leaf.num}".strip()
-        meta_base = {
-            "mode": "article_only",
-            "doc_type": result.doc_type,
-            "law_name": law_name or "",
-            "section_label": section_label,
-            "source_file": source_file or "",
-        }
+        crumbs = _breadcrumbs(leaf, result)
+        section_uid = "/".join(crumbs) if crumbs else section_label
 
-        # 같은 조문 내에서만 필요시 part 분할
-        spans = _split_long_article(
-            text=result.full_text[leaf.span_start:leaf.span_end],
-            start=leaf.span_start,
-            limit=MAX_NODE_CHARS,
-        )
+        spans = [(leaf.span_start, leaf.span_end)]
+        # 과대 조문 분할(실제 발생하지 않도록 상한 넉넉히 설정)
+        new_spans: List[Tuple[int, int]] = []
+        for s, e in spans:
+            frag = text[s:e]
+            if len(frag) <= MAX_NODE_CHARS:
+                new_spans.append((s, e))
+            else:
+                # 문단 경계 기준으로 자르기
+                p = s
+                while p < e:
+                    q = min(p + MAX_NODE_CHARS, e)
+                    cut = text.rfind("\n\n", p, q)
+                    if cut != -1 and (cut - p) > 200:
+                        q = cut + 2
+                    new_spans.append((p, q))
+                    p = q
 
-        for k, (s, e) in enumerate(spans, 1):
-            label = section_label + (f" (part {k})" if len(spans) > 1 else "")
+        for k, (s, e) in enumerate(new_spans, 1):
+            label = section_label + (f" (part {k})" if len(new_spans) > 1 else "")
+            meta = {
+                "type": "article",
+                "mode": mode,
+                "doc_type": result.doc_type,
+                "law_name": law_name or "",
+                "section_label": label,
+                "section_uid": section_uid,
+                "source_file": source_file or "",
+                "article_index_global": str(article_index),
+                "series": str(series_map.get(leaf.node_id, 1)),
+                "retrieval_weight": str(_retrieval_weight_for("article")),
+            }
             chunks.append(
                 Chunk(
-                    text=result.full_text[s:e],
+                    text=text[s:e],
                     span_start=s,
                     span_end=e,
                     node_ids=[leaf.node_id],
-                    breadcrumbs=_breadcrumbs(leaf, result),
-                    meta={**meta_base, "section_label": label},
+                    breadcrumbs=crumbs,
+                    meta=meta,
                 )
             )
 
-    # 문서 순서 보장
+    # 2) front_matter
+    if include_front_matter:
+        # 파서가 front_matter 노드를 이미 만들었을 수 있음
+        for n in result.root.children:
+            if n.label == "front_matter" and (n.span_end - n.span_start) > 0:
+                frag = text[n.span_start:n.span_end]
+                if frag.strip():
+                    crumbs = ["front_matter"]
+                    meta = {
+                        "type": "front_matter",
+                        "mode": mode,
+                        "doc_type": result.doc_type,
+                        "law_name": law_name or "",
+                        "section_label": "front_matter",
+                        "section_uid": "front_matter",
+                        "source_file": source_file or "",
+                        "retrieval_weight": str(_retrieval_weight_for("front_matter")),
+                    }
+                    chunks.append(
+                        Chunk(
+                            text=frag,
+                            span_start=n.span_start,
+                            span_end=n.span_end,
+                            node_ids=[n.node_id],
+                            breadcrumbs=crumbs,
+                            meta=meta,
+                        )
+                    )
+                break
+
+    # 3) headnotes (상위 헤더 안의 머리말)
+    if include_headnotes:
+        def walk(parent: Node):
+            if parent.label not in ("root", "front_matter"):
+                # 자식 스팬 합집합을 빼고 남는 부분
+                child_spans = [(c.span_start, c.span_end) for c in parent.children]
+                covered = _compute_union(child_spans)
+                leftovers = _subtract_intervals((parent.span_start, parent.span_end), covered)
+                for (s, e) in leftovers:
+                    frag = text[s:e]
+                    if len(frag.strip()) >= min_headnote_len:
+                        crumbs = _breadcrumbs(parent, result)
+                        section_label = f"{parent.label} {parent.num}".strip() if parent.num else parent.label or "headnote"
+                        section_uid = "/".join(crumbs) + " — headnote" if crumbs else f"{section_label} — headnote"
+                        meta = {
+                            "type": "headnote",
+                            "mode": mode,
+                            "doc_type": result.doc_type,
+                            "law_name": law_name or "",
+                            "section_label": f"{section_label} — headnote",
+                            "section_uid": section_uid,
+                            "source_file": source_file or "",
+                            "retrieval_weight": str(_retrieval_weight_for("headnote")),
+                        }
+                        chunks.append(
+                            Chunk(
+                                text=frag,
+                                span_start=s,
+                                span_end=e,
+                                node_ids=[parent.node_id],
+                                breadcrumbs=crumbs,
+                                meta=meta,
+                            )
+                        )
+            for c in parent.children:
+                walk(c)
+        walk(result.root)
+
+    # 4) gap-sweeper (전역 간극 보강)
+    if include_gap_fallback:
+        ivs = _compute_union([(c.span_start, c.span_end) for c in chunks])
+        gaps: List[Tuple[int, int]] = []
+        prev = 0
+        for s, e in ivs:
+            if s > prev:
+                gaps.append((prev, s))
+            prev = e
+        if prev < total_len:
+            gaps.append((prev, total_len))
+
+        for idx, (s, e) in enumerate(gaps, 1):
+            frag = text[s:e]
+            if len(frag.strip()) >= min_gap_len:
+                crumbs = _find_path_at_offset(result, s)
+                meta = {
+                    "type": "orphan_gap",
+                    "mode": mode,
+                    "doc_type": result.doc_type,
+                    "law_name": law_name or "",
+                    "section_label": f"orphan_gap #{idx}",
+                    "section_uid": f"gap[{s}:{e}]",
+                    "source_file": source_file or "",
+                    "retrieval_weight": str(_retrieval_weight_for("orphan_gap")),
+                }
+                chunks.append(
+                    Chunk(
+                        text=frag,
+                        span_start=s,
+                        span_end=e,
+                        node_ids=[],
+                        breadcrumbs=crumbs,
+                        meta=meta,
+                    )
+                )
+
+    # 정렬 보장
     chunks.sort(key=lambda c: c.span_start)
     return chunks
