@@ -13,9 +13,9 @@ from parser_core.postprocess import (
     repair_tree,  # 트리 수복
 )
 from parser_core.schema import ParseResult, Node, Chunk
-from exporters.writers import to_jsonl, make_debug_report  # ← REPORT.json 생성용
+from exporters.writers import to_jsonl, make_debug_report  # REPORT.json 생성
 
-APP_TITLE = "Thai Legal Preprocessor — Full Text + Leaf Brackets (연두 중괄호, 오버랩 분할)"
+APP_TITLE = "Thai Legal Preprocessor — Full Text + Brackets (leaf/chunk)"
 
 # ───────────────────────────── UI helpers ───────────────────────────── #
 
@@ -24,36 +24,29 @@ def _inject_css():
         """
         <style>
           .block-container { max-width: 1400px !important; padding-top: .75rem; }
-
-          /* 상단 툴바는 최대한 단순하게 */
-          .toolbar { position: sticky; top: 0; z-index: 10; padding: 0 0 .5rem;
-                     background: var(--background-color); }
-
-          /* 원문 박스 */
           .docwrap { border: 1px solid rgba(107,114,128,.25); border-radius: 10px; padding: 16px; }
           .doc { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
                  font-size: 13.5px; line-height: 1.6; position: relative; }
 
-          /* 연두색 중괄호(최하위 노드 전체 구간만 감쌈) */
+          /* 연두색 중괄호(스팬 전체 감쌈) */
           .bracket-block { position: relative; padding: 0 12px; border-radius: 6px; margin: 0 1px; }
           .bracket-block::before, .bracket-block::after {
             content: "{"; position: absolute; top: -1px; bottom: -1px; width: 10px;
-            color: #a3e635;            /* lime-400, 더 밝게 */
-            opacity: .90; font-weight: 800;
+            color: #a3e635; opacity: .90; font-weight: 800;
           }
           .bracket-block::before { left: 0; }
           .bracket-block::after  { right: 0; transform: scaleX(-1); }
 
-          /* 파싱 버튼 강조 */
-          div.parse-btn > button[kind="secondary"], div.parse-btn > button[kind="primary"] {
-            background: #22c55e !important; color: white !important; border: 0 !important;
-            padding: .7rem 1.2rem !important; font-weight: 800 !important; font-size: 16px !important;
-            border-radius: 10px !important;
-          }
-
-          /* 다운로드 버튼 가독성 */
-          .dlbar { display:flex; gap:10px; align-items:center; margin: .5rem 0 .75rem; }
+          /* 닫는 표시 + 번호 */
+          .close-tail { color: #a3e635; font-weight: 800; }
+          .dlbar { display:flex; gap:10px; align-items:center; margin: .6rem 0 .6rem; }
           .muted { color:#6b7280; font-size: 12px; }
+
+          /* 파싱 버튼 크게/선명하게 */
+          .parse-line { margin-top: .25rem; margin-bottom: .5rem; }
+          .parse-line button { background: #22c55e !important; color: white !important; border: 0 !important;
+                               padding: .75rem 1.2rem !important; font-weight: 800 !important; font-size: 16px !important;
+                               border-radius: 10px !important; width: 100%; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -82,6 +75,10 @@ def _ensure_state():
         "min_headnote_len": 24,
         "min_gap_len": 24,
         "allowed_headnote_levels": ["ภาค","ลักษณะ","หมวด","ส่วน","บท"],
+        # 표시 옵션
+        "bracket_mode": "리프(มาตรา/ข้อ)",     # 또는 "청크"
+        "number_scope": "article만",          # 또는 "전체 청크"
+        "bracket_front_matter": True,         # 문서 첫부분도 중괄호로 볼지
         # 내부 저장(다운로드용)
         "report_json_str": "",
         "chunks_jsonl_str": "",
@@ -103,7 +100,7 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
 def _html_escape(s: str) -> str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-# ───────────────────────────── Leaf renderer (리프 노드로 감싸기) ───────────────────────────── #
+# ───────────────────────────── Bracket renderers ───────────────────────────── #
 
 def _collect_article_leaves(root: Node) -> List[Node]:
     leaves: List[Node] = []
@@ -117,20 +114,20 @@ def _collect_article_leaves(root: Node) -> List[Node]:
     leaves.sort(key=lambda x: x.span_start)
     return leaves
 
-def render_leaf_brackets(text: str, result: ParseResult) -> str:
+def render_leaf_brackets(text: str, result: ParseResult, *, add_newline=True, add_number=False) -> str:
     """
     원문 전체를 그대로 출력하되,
     제일 하위 노드(มาตรา/ข้อ)의 스팬을 연두 중괄호로 감싼다.
-    (청크 분할과 무관하게 '조문 전체' 구간만 표시)
     """
     N = len(text)
     leaves = _collect_article_leaves(result.root)
 
     parts: List[str] = []
     cur = 0
+    leaf_idx = 0
     for lf in leaves:
         s, e = int(lf.span_start), int(lf.span_end)
-        if s < 0 or e > N or e <= s:  # 안전장치
+        if s < 0 or e > N or e <= s:
             continue
         if s > cur:
             parts.append(_html_escape(text[cur:s]))
@@ -144,12 +141,66 @@ def render_leaf_brackets(text: str, result: ParseResult) -> str:
             p = result.node_map.get(p.parent_id)
         crumbs = " / ".join(reversed(crumbs))
         title = label if not crumbs else f"{label} — {crumbs}"
-        # 중괄호가 연속으로 보일 때 가독성을 위해 작은 마진(margin: 0 1px)을 둔다.
+
         parts.append(f'<span class="bracket-block" title="{_html_escape(title)}">{seg}</span>')
+        # 닫는 괄호 뒤 표시
+        tail = ""
+        if add_number:
+            leaf_idx += 1
+            tail = f' <span class="close-tail">}} leaf {leaf_idx:04d}</span>'
+        else:
+            tail = ' <span class="close-tail">}}</span>'
+        if add_newline:
+            tail += "<br/>"
+        parts.append(tail)
         cur = e
     if cur < N:
         parts.append(_html_escape(text[cur:N]))
+    return '<div class="doc">' + "".join(parts) + "</div>"
 
+def render_chunk_brackets(
+    text: str,
+    chunks: List[Chunk],
+    *,
+    number_scope: str = "article만",   # 또는 "전체 청크"
+    bracket_front_matter: bool = True,
+    add_newline: bool = True,
+) -> str:
+    """
+    원문 전체를 그대로 출력하되,
+    '청크' 스팬을 연두 중괄호로 감싸고 } 뒤에 'chunk 0001'을 붙인다.
+    - number_scope='article만'이면 article 타입만 번호를 매김(표시는 article만)
+    - number_scope='전체 청크'이면 front_matter/headnote도 표시+번호 매김
+    """
+    N = len(text)
+    if number_scope == "전체 청크":
+        units = [c for c in chunks if c.meta.get("type") in ("front_matter","article","headnote")]
+    else:
+        units = [c for c in chunks if c.meta.get("type") == "article"]
+        if bracket_front_matter:
+            fms = [c for c in chunks if c.meta.get("type") == "front_matter"]
+            units = (fms + units) if fms else units
+    units.sort(key=lambda c: (c.span_start, c.span_end))
+
+    parts: List[str] = []
+    cur = 0
+    idx = 0
+    for c in units:
+        s, e = int(c.span_start), int(c.span_end)
+        if s < 0 or e > N or e <= s:
+            continue
+        if s > cur:
+            parts.append(_html_escape(text[cur:s]))
+        seg = _html_escape(text[s:e])
+        parts.append(f'<span class="bracket-block" title="{_html_escape(c.meta.get("section_label","chunk"))}">{seg}</span>')
+        idx += 1
+        tail = f' <span class="close-tail">}} chunk {idx:04d}</span>'
+        if add_newline:
+            tail += "<br/>"
+        parts.append(tail)
+        cur = e
+    if cur < N:
+        parts.append(_html_escape(text[cur:N]))
     return '<div class="doc">' + "".join(parts) + "</div>"
 
 # ───────────────────────────── Main ───────────────────────────── #
@@ -159,14 +210,15 @@ def main():
     _ensure_state()
 
     st.title(APP_TITLE)
-    st.caption("Upload UTF-8 Thai legal .txt → [파싱] → 원문 전체 표시 + 최하위 노드(조문/ข้อ)만 연두 중괄호로 감싸기")
+    st.caption("Upload UTF-8 Thai legal .txt → [파싱] → 원문 전체 + 브래킷 표시(리프/청크)")
 
-    # 업로더
     uploaded = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
 
     # ▶ 파싱 버튼: 파일명 바로 아래, 크고 눈에 띄게
-    parse_clicked = st.button("파싱", key="parse_btn_top", use_container_width=True)
-    st.markdown('<div class="parse-btn"></div>', unsafe_allow_html=True)  # CSS 타겟용 래퍼
+    with st.container():
+        st.markdown('<div class="parse-line">', unsafe_allow_html=True)
+        parse_clicked = st.button("파싱", key="parse_btn_top")
+        st.markdown('</div>', unsafe_allow_html=True)
 
     # 옵션: 한 줄에 3개(분할 임계값, tail 병합, 오버랩)
     col1, col2, col3 = st.columns(3)
@@ -177,15 +229,21 @@ def main():
     with col3:
         st.session_state["overlap_chars"] = st.number_input("오버랩(문맥) 길이", min_value=0, max_value=800, value=st.session_state["overlap_chars"], step=25)
 
-    # 나머지 옵션(간단)
+    # 표시 옵션
     oc1, oc2, oc3 = st.columns(3)
     with oc1:
-        st.session_state["strict_lossless"] = st.checkbox("Strict 무손실(coverage=1.0)", value=st.session_state["strict_lossless"])
+        st.session_state["bracket_mode"] = st.selectbox("브래킷 기준", ["리프(มาตรา/ข้อ)", "청크"], index=0)
     with oc2:
-        st.session_state["split_long_articles"] = st.checkbox("롱 조문 분할(문단 경계)", value=st.session_state["split_long_articles"])
+        st.session_state["number_scope"] = st.selectbox("번호 기준", ["article만", "전체 청크"], index=0)
     with oc3:
-        # reserved
-        pass
+        st.session_state["bracket_front_matter"] = st.checkbox("문서 첫부분도 중괄호(Front matter)", value=st.session_state["bracket_front_matter"])
+
+    # 나머지 옵션(간단)
+    oc4, oc5, _ = st.columns(3)
+    with oc4:
+        st.session_state["strict_lossless"] = st.checkbox("Strict 무손실(coverage=1.0)", value=st.session_state["strict_lossless"])
+    with oc5:
+        st.session_state["split_long_articles"] = st.checkbox("롱 조문 분할(문단 경계)", value=st.session_state["split_long_articles"])
 
     # 파일 적재
     if uploaded is not None:
@@ -249,6 +307,9 @@ def main():
                 "split_threshold_chars": int(st.session_state["split_threshold_chars"]),
                 "tail_merge_min_chars": int(st.session_state["tail_merge_min_chars"]),
                 "overlap_chars": int(st.session_state["overlap_chars"]),
+                "bracket_mode": st.session_state["bracket_mode"],
+                "number_scope": st.session_state["number_scope"],
+                "bracket_front_matter": bool(st.session_state["bracket_front_matter"]),
             },
             debug={
                 "tree_repair": {
@@ -280,18 +341,15 @@ def main():
         arts = [c for c in st.session_state["chunks"] if c.meta.get("type") == "article"]
 
         # 간단 정보
-        with st.container():
-            st.markdown("<div class='toolbar'>", unsafe_allow_html=True)
-            st.write(
-                f"**파일:** {st.session_state['source_file']}  |  "
-                f"**doc_type:** {st.session_state['doc_type']}  |  "
-                f"**law_name:** {st.session_state['law_name'] or 'N/A'}  |  "
-                f"**chunks:** {len(st.session_state['chunks'])} (article {len(arts)})  |  "
-                f"**coverage:** {cov:.6f}"
-            )
-            st.markdown("</div>", unsafe_allow_html=True)
+        st.write(
+            f"**파일:** {st.session_state['source_file']}  |  "
+            f"**doc_type:** {st.session_state['doc_type']}  |  "
+            f"**law_name:** {st.session_state['law_name'] or 'N/A'}  |  "
+            f"**chunks:** {len(st.session_state['chunks'])} (article {len(arts)})  |  "
+            f"**coverage:** {cov:.6f}"
+        )
 
-        # ➜ 다운로드 바 (요청대로: 원문 바로 '위'쪽에 배치)
+        # 다운로드 바 (한 줄)
         st.markdown('<div class="dlbar">', unsafe_allow_html=True)
         st.download_button(
             "JSONL 다운로드 (CHUNKS.jsonl)",
@@ -307,14 +365,25 @@ def main():
             mime="application/json",
             key="dl-report-bottom",
         )
-        st.markdown('<span class="muted">※ ZIP 번들은 생략하고, JSONL/REPORT를 바로 다운로드할 수 있게 했어요.</span>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # 원문 전체 + 리프 노드만 중괄호 감싸기(표시)
-        html = render_leaf_brackets(
-            text=st.session_state["result"].full_text,
-            result=st.session_state["result"],
-        )
+        # 원문 전체 + 브래킷 표시
+        if st.session_state["bracket_mode"] == "청크":
+            html = render_chunk_brackets(
+                text=st.session_state["result"].full_text,
+                chunks=st.session_state["chunks"],
+                number_scope=st.session_state["number_scope"],
+                bracket_front_matter=bool(st.session_state["bracket_front_matter"]),
+                add_newline=True,
+            )
+        else:
+            html = render_leaf_brackets(
+                text=st.session_state["result"].full_text,
+                result=st.session_state["result"],
+                add_newline=True,
+                add_number=False,  # 리프 모드에선 번호 기본 비활성(원하면 True로)
+            )
+
         st.markdown('<div class="docwrap">' + html + "</div>", unsafe_allow_html=True)
 
         # 경고 노출(있다면)
