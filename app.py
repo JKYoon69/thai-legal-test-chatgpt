@@ -2,14 +2,15 @@
 """
 Thai Legal Preprocessor — RAG-ready (lossless + debug)
 
-Safe changes / what's new:
+What's included:
 - English UI.
-- One-click "Download All" (ZIP with rich.jsonl, compat.jsonl, REPORT.json).
-- "New File" button resets the whole app state and uploader.
+- Big/clear "Parse" button (primary CTA), smaller "New File" button.
+- One-line download row (4 columns): ZIP (all) + rich + compat + report.
 - Structure-free fallback chunking (paragraph+length) for structureless docs only.
-- Enumeration boundary snap with coverage repair + label/UID reconciliation when anchors disagree.
+- Enumeration boundary snap + label/UID reconciliation.
 - Zero-length cleanup; overlap visualization; LLM usage/cost in REPORT.
-- Mode flag ("structured" | "fallback") recorded in report.
+- Mode flag ("structured" | "fallback") in report.
+- Stronger law_name normalization (detects preamble like "อาศัยอำนาจ..." and falls back to filename).
 """
 
 import os, sys, re, time, json, math, io, zipfile, hashlib, random
@@ -62,17 +63,27 @@ def _basename_no_ext(name: str) -> str:
     if "." in base: base = base.rsplit(".",1)[0]
     return base
 
+def _looks_like_preamble(name: str) -> bool:
+    # Thai preamble starts like “อาศัยอำนาจตามความใน...” etc.
+    return bool(re.search(r"(?:^|\s)(อาศัยอำนาจ|โดยอาศัยอำนาจ)\b", name))
+
 def _normalize_law_name(name: Optional[str], fallback_filename: str) -> str:
-    """Tighten weird spacing and backfill from filename if it looks too short."""
+    """
+    Tighten weird spacing; avoid using preamble sentence as a title.
+    If name looks like a preamble or is too short, fallback to filename (base).
+    """
     if not name: name = ""
-    # collapse weird Thai spacing artifacts
     name = re.sub(r"\s+", " ", name).strip()
-    # if name too short, fall back to filename (minus extension)
-    if len(name) < 6:
-        name = _basename_no_ext(fallback_filename)
-    # ensure year / ฉบับที่ kept contiguous
+    # keep year / edition contiguous
     name = re.sub(r"(พ\.ศ\.)\s+(\d{4})", r"\1 \2", name)
     name = re.sub(r"(ฉบับที่)\s+(\d+)", r"\1 \2", name)
+
+    base = _basename_no_ext(fallback_filename)
+    if _looks_like_preamble(name) or len(name) < 6:
+        return base
+    # Also cap overly long names (likely noisy)
+    if len(name) > 120 and _looks_like_preamble(name):
+        return base
     return name
 
 # ----------------------- Fallback chunking -----------------------
@@ -102,16 +113,14 @@ def _paragraph_breaks(text: str) -> List[int]:
 
 def _second_cut_candidates(seg: str) -> List[int]:
     """
-    Optional inner split hints for very long paragraphs:
+    Inner hints for very long paragraphs:
     - list items like '1) ', 'ข้อ 3', bullets
-    - punctuation hints like ';' or ':' followed by newline/space
-    Returns list of local offsets (within seg) where a cut could happen.
+    - punctuation hints like ';' or ':' followed by space
+    Returns local offsets (within seg).
     """
     cand = set()
-    # list numbers or Thai article indicators
     for m in re.finditer(r'(?m)^(?:\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\)\s+|(?:ข้อ|มาตรา)\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\b|[•·\-–—]\s+)', seg):
         cand.add(m.start())
-    # punctuation hints
     for m in re.finditer(r'[;:]\s+(?=\S)', seg):
         cand.add(m.end())
     return sorted(cand)
@@ -122,7 +131,7 @@ def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
     """
     Structure-free length-based split:
     - Prefer paragraph boundaries within [pos+min, pos+target]
-    - If not available, extend search window slightly; otherwise hard-cut
+    - If not available, extend the window slightly; otherwise hard-cut
     - Optional second-cut hints inside very long paragraphs
     - Tail merge if last piece too short
     """
@@ -141,21 +150,17 @@ def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
         if cand:
             cut = max(cand)
         else:
-            # try extended window
             ext_hi = min(N, hi + ext)
             cand2 = [b for b in breaks if hi < b <= ext_hi]
             cut = (min(N, pos + target_chars) if not cand2 else min(max(cand2), N))
-
         if cut is None or cut <= pos:
             cut = min(N, pos + target_chars)
             if cut <= pos:
                 break
 
-        # Optional inner hint to avoid overly long paragraph cores
         if enable_second_cut and (cut - pos) > int(1.25 * target_chars):
             local = full_text[pos:cut]
             hints = _second_cut_candidates(local)
-            # choose the furthest hint after min_chars but before target_chars if possible
             good = [pos + h for h in hints if (pos + h) >= lo and (pos + h) <= (pos + target_chars)]
             if good:
                 cut = max(good)
@@ -163,7 +168,6 @@ def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
         cores.append((pos, cut))
         pos = cut
 
-    # tail merge
     if len(cores) >= 2 and (cores[-1][1] - cores[-1][0]) < tail_merge_min_chars:
         cores[-2] = (cores[-2][0], cores[-1][1])
         cores.pop()
@@ -173,7 +177,7 @@ def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
         s = max(0, cs - (overlap_chars if i>1 else 0))
         e = min(N, ce + (overlap_chars if i < len(cores) else 0))
         meta = {
-            "type": "article",  # downstream compatibility
+            "type": "article",
             "law_name": law_name or "",
             "source_file": source_file or "",
             "section_label": f"part {i}",
@@ -195,13 +199,11 @@ def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
     return chunks, diag
 
 # ----------------------- Enumeration snap + label reconciliation -----------------------
-# Thai digits range: \u0E50-\u0E59
 ENUM_PATTERNS = [
     ("digit", re.compile(r'^\s*[\(\[\{]?\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*[\)\]\}]?\s*')),
     ("lawterm", re.compile(r'^\s*(?:ข้อ|มาตรา)\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*')),
     ("bullet", re.compile(r'^\s*(?:•|·|-|—|–)\s+')),
 ]
-
 THAI_DIGITS = {ord('๐'): '0', ord('๑'): '1', ord('๒'): '2', ord('๓'): '3', ord('๔'): '4',
                ord('๕'): '5', ord('๖'): '6', ord('๗'): '7', ord('๘'): '8', ord('๙'): '9'}
 
@@ -224,7 +226,6 @@ def _refresh_text(c, full_text: str) -> None:
     c.text = full_text[int(c.span_start):int(c.span_end)]
 
 def _parse_anchor_label(anchor_text: str) -> Optional[str]:
-    """Return normalized section label like 'มาตรา 12' or 'ข้อ 3' if detectable."""
     t = anchor_text.strip()
     m = re.match(r'^(ข้อ|มาตรา)\s*([\d\u0E50-\u0E59]{1,4})', t)
     if not m:
@@ -234,13 +235,6 @@ def _parse_anchor_label(anchor_text: str) -> Optional[str]:
     return f"{head} {num}"
 
 def normalize_enumeration_boundaries(chunks, full_text: str, *, reconcile_labels: bool=True) -> Dict[str, Any]:
-    """
-    Use enumeration/bullet anchors on the next-chunk line start:
-    - prev.span_end = enum_start  (trim tail before the anchor)
-    - next.span_start = enum_start (close gaps)
-    - next.core_span[0] = enum_start (include anchor into core)
-    - (optional) reconcile next.meta.section_label with the anchor
-    """
     diag = {
         "pairs_seen": 0, "hits": 0, "cut_only": 0, "shift_only": 0, "both": 0,
         "pattern_hits": {"digit":0,"lawterm":0,"bullet":0},
@@ -248,14 +242,12 @@ def normalize_enumeration_boundaries(chunks, full_text: str, *, reconcile_labels
         "label_mismatch_fixed": 0, "label_samples": []
     }
     if not chunks: return diag
-
     units = [c for c in chunks if (c.meta or {}).get("type") in ("article","article_pack")]
     units.sort(key=lambda c:(int(c.span_start), int(c.span_end)))
 
     for i in range(1, len(units)):
         prev = units[i-1]; cur = units[i]
         diag["pairs_seen"] += 1
-
         s_next = int(cur.span_start)
         hit = _detect_enum_anchor_at_chunk_start(full_text, s_next)
         if not hit:
@@ -298,28 +290,23 @@ def normalize_enumeration_boundaries(chunks, full_text: str, *, reconcile_labels
             applied_shift=True
             diag["core_moved_to_enum"] += 1
 
-        # 4) optional: reconcile label with anchor
+        # 4) reconcile label if we matched a lawterm
         if reconcile_labels and kind == "lawterm":
             anchor_label = _parse_anchor_label(full_text[enum_s:enum_e] or "")
             if anchor_label:
                 old_label = (cur.meta or {}).get("section_label","")
                 if old_label.strip() != anchor_label.strip():
-                    # keep history
                     prev_labels = (cur.meta or {}).get("prev_labels", [])
                     if old_label and old_label not in prev_labels:
                         prev_labels = prev_labels + [old_label]
                     cur.meta["prev_labels"] = prev_labels
-                    # set new label and UID
                     cur.meta["section_label"] = anchor_label
-                    # keep part suffix if existed, e.g., "(part 2)"
                     m = re.search(r"\(part\s*\d+\)", old_label)
                     if m:
                         cur.meta["section_label"] += f" {m.group(0)}"
                     uid_suffix = cur.meta.get("core_span",[int(cur.span_start), int(cur.span_end)])[0]
                     cur.meta["section_uid"] = f"{cur.meta['section_label']}|{uid_suffix}"
                     diag["label_mismatch_fixed"] += 1
-                    if len(diag["label_samples"]) < 5:
-                        diag["label_samples"].append({"old": old_label, "new": cur.meta["section_label"]})
 
         if applied_cut or applied_shift or applied_next_start:
             diag["hits"] += 1
@@ -337,9 +324,6 @@ def normalize_enumeration_boundaries(chunks, full_text: str, *, reconcile_labels
     return diag
 
 def fix_zero_length_and_gaps(chunks: List, full_text: str) -> Dict[str, Any]:
-    """
-    Clean zero-length chunks and pull next.start back to cover potential gaps left by snapping.
-    """
     diag = {"removed_zero_span":0, "fixed_next_start":0, "removed_labels":[]}
     chunks.sort(key=lambda c:(int(c.span_start), int(c.span_end)))
     i=0
@@ -380,16 +364,18 @@ def _inject_css():
       .overlap { background: rgba(244,114,182,.22); }
       .overlap-mark { color:#ec4899; font-weight:800; }
       .close-tail { color:#b8f55a; font-weight:800; }
-      .dlbar { display:flex; gap:10px; align-items:center; margin:.6rem 0 .6rem; flex-wrap:wrap; }
-      .parse-line { margin:.25rem 0 .6rem; display:flex; gap:.5rem; }
-      .parse-line button { background:#22c55e !important; color:#fff !important; border:0 !important;
-                           padding:.6rem 1rem !important; font-weight:800 !important; font-size:15px !important;
-                           border-radius:10px !important; }
-      .danger { background:#ef4444 !important; }
-      .accent { background:#3b82f6 !important; }
+      .parse-row { display:flex; gap:.75rem; margin:.35rem 0 1rem; align-items:center; }
+      .cta-parse .stButton > button {
+        background:#16a34a !important; color:#fff !important; border:0 !important;
+        padding:14px 24px !important; font-weight:800 !important; font-size:18px !important;
+        border-radius:12px !important; width:100%; box-shadow:0 6px 18px rgba(22,163,74,.25);
+      }
+      .btn-secondary .stButton > button {
+        background:#ef4444 !important; color:#fff !important; border:0 !important;
+        padding:10px 16px !important; font-weight:700 !important; font-size:14px !important;
+        border-radius:10px !important;
+      }
       .badge-warn { display:inline-block; padding:2px 8px; border-radius:8px; background:#fee2e2; color:#b91c1c; font-weight:700; }
-      .muted { color:#9ca3af; font-size:12px; }
-      .kv { font-size:12.5px; color:#93c5fd; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -446,12 +432,12 @@ def _defaults() -> Dict[str, Any]:
         # fallback-only knobs
         "fallback_enable": True,
         "fallback_target_chars": 1200,
-        "fallback_min_ratio": 0.40,   # min_chars = target * this
+        "fallback_min_ratio": 0.40,
         "fallback_second_cut": True,
         # LLM options
         "use_llm_summary":True, "skip_short_chars":180, "batch_group_size":8, "parallel_calls":3, "max_calls":0,
         "llm_cache":{}, "llm_errors":[],
-        # outputs (strings)
+        # outputs
         "report_json_str":"", "chunks_jsonl_rich":"", "chunks_jsonl_flat":"",
         # UI
         "upload_key": str(random.random()),
@@ -492,10 +478,19 @@ def main():
     _inject_css(); _ensure_state()
     st.title(APP_TITLE)
 
-    # Top action row: New File + Parse
-    st.markdown('<div class="parse-line">', unsafe_allow_html=True)
-    new_file = st.button("New File", key="btn_new", type="secondary")
-    parse_btn = st.button("Parse", key="parse_btn_top")
+    # Top action row: New File (small) + Parse (big)
+    st.markdown('<div class="parse-row">', unsafe_allow_html=True)
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        with st.container():
+            st.markdown('<div class="btn-secondary">', unsafe_allow_html=True)
+            new_file = st.button("New File", key="btn_new", type="secondary")
+            st.markdown('</div>', unsafe_allow_html=True)
+    with c2:
+        with st.container():
+            st.markdown('<div class="cta-parse">', unsafe_allow_html=True)
+            parse_btn = st.button("Parse", key="parse_btn_top")
+            st.markdown('</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
     if new_file:
@@ -631,7 +626,7 @@ def main():
                 mk_diag["micro_sweeper_tail"] = {"max_tail_chars": tail_threshold, **sweep_diag}
             panel.log(f"Micro sweeper · merged={sweep_diag.get('merged_count',0)}")
 
-            # 3c) Enumeration boundary snap (pairwise) + label reconciliation
+            # 3c) Enumeration boundary snap + label reconciliation
             enum_diag = normalize_enumeration_boundaries(chunks, full_text=result.full_text, reconcile_labels=True)
             panel.log(f"Anchor snap · pairs={enum_diag['pairs_seen']}, hits={enum_diag['hits']}, label_fixes={enum_diag['label_mismatch_fixed']}")
 
@@ -764,17 +759,16 @@ def main():
                     panel.log("LLM summarization skipped: no article-like chunks")
                 else:
                     panel.log("LLM summarization disabled")
-                # keep empty stats structure
 
             st.session_state["llm_errors"] = llm_errors
 
             # Derived stats
             def _safe_div(a, b): return (a / b) if (b and b != 0) else 0.0
             derived = {
-                "avg_tokens_per_section": round(_safe_div(stats["usage_total_tokens"], max(1, stats.get("sections_new_calls",0))), 2),
-                "avg_ms_per_batch": round(_safe_div(stats["elapsed_ms_sum"], max(1, stats.get("batches",0))), 2),
-                "sections_per_second": round(_safe_div(stats.get("sections_new_calls",0), stats["elapsed_ms_sum"]/1000.0 if stats["elapsed_ms_sum"] else 0), 3) if stats.get("sections_new_calls",0) else 0.0,
-                "effective_unit_cost_per_1k": round(_safe_div(stats["est_cost_usd"], (stats["usage_total_tokens"]/1000.0) if stats["usage_total_tokens"] else 0), 6) if stats["usage_total_tokens"] else None,
+                "avg_tokens_per_section": round(_safe_div(stats.get("usage_total_tokens",0), max(1, stats.get("sections_new_calls",0))), 2),
+                "avg_ms_per_batch": round(_safe_div(stats.get("elapsed_ms_sum",0), max(1, stats.get("batches",0))), 2),
+                "sections_per_second": round(_safe_div(stats.get("sections_new_calls",0), stats.get("elapsed_ms_sum",0)/1000.0 if stats.get("elapsed_ms_sum",0) else 0), 3) if stats.get("sections_new_calls",0) else 0.0,
+                "effective_unit_cost_per_1k": round(_safe_div(stats.get("est_cost_usd",0.0), (stats.get("usage_total_tokens",0)/1000.0) if stats.get("usage_total_tokens",0) else 0), 6) if stats.get("usage_total_tokens",0) else None,
                 "pricing_source": "derived_effective"
             }
             stats.update({"derived": derived})
@@ -785,7 +779,7 @@ def main():
             report_str = make_debug_report(
                 parse_result=result, chunks=chunks, source_file=src, law_name=base_law or "",
                 run_config={
-                    "mode": mode,  # <— structured | fallback
+                    "mode": mode,
                     "strict_lossless":st.session_state["strict_lossless"],
                     "split_long_articles":st.session_state["split_long_articles"],
                     "split_threshold_chars":st.session_state["split_threshold_chars"],
@@ -861,13 +855,16 @@ def main():
             zf.writestr(f"{base}_REPORT.json", report_bytes)
         zip_buf.seek(0)
 
-        st.markdown('<div class="dlbar">', unsafe_allow_html=True)
-        st.download_button("Download All (ZIP)", data=zip_buf, file_name=f"{base}_ALL.zip", mime="application/zip", key="dl-all-zip")
-        # Optional: still offer individual downloads
-        st.download_button("Download — Rich JSONL", rich_bytes, file_name=f"{base}_chunks_rich.jsonl", mime="application/json", key="dl-jsonl-rich")
-        st.download_button("Download — Compat JSONL", flat_bytes, file_name=f"{base}_chunks_compat.jsonl", mime="application/json", key="dl-jsonl-flat")
-        st.download_button("Download — REPORT.json", report_bytes, file_name=f"{base}_REPORT.json", mime="application/json", key="dl-report-json")
-        st.markdown('</div>', unsafe_allow_html=True)
+        # Single row: 4 columns
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        with c1:
+            st.download_button("Download All (ZIP)", data=zip_buf, file_name=f"{base}_ALL.zip", mime="application/zip", key="dl-all-zip")
+        with c2:
+            st.download_button("Rich JSONL", rich_bytes, file_name=f"{base}_chunks_rich.jsonl", mime="application/json", key="dl-jsonl-rich")
+        with c3:
+            st.download_button("Compat JSONL", flat_bytes, file_name=f"{base}_chunks_compat.jsonl", mime="application/json", key="dl-jsonl-flat")
+        with c4:
+            st.download_button("REPORT.json", report_bytes, file_name=f"{base}_REPORT.json", mime="application/json", key="dl-report-json")
 
         html = render_with_overlap(
             text=st.session_state["result"].full_text,
