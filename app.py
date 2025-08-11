@@ -3,7 +3,7 @@ import time, json, math, os, sys
 from typing import List, Dict, Any, Tuple
 import streamlit as st
 
-# --- 경로 보정: 현재 파일 디렉토리를 sys.path에 추가 (Streamlit Cloud 대비) ---
+# --- 경로 보정 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
@@ -16,21 +16,17 @@ from parser_core.postprocess import (
 )
 from parser_core.schema import ParseResult, Chunk
 
-# 익스포트 (writers 위치 호환: 루트 writers.py 또는 exporters/writers.py)
+# 익스포트 (writers 위치 호환)
 try:
-    from writers import (
-        to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
-    )
+    from writers import to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
 except ModuleNotFoundError:
-    from exporters.writers import (
-        to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
-    )
+    from exporters.writers import to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
 
 # LLM (요약 배치/캐시)
 from llm_clients import call_openai_batch
 from extractors import build_summary_record
 
-APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)  (Batch+Cache, Dual Exports + Tail-Sweep)"
+APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
 
 # ---------- 스타일 ----------
 def _inject_css():
@@ -47,7 +43,7 @@ def _inject_css():
       }
       .chunk-wrap::before { left:0; }
       .chunk-wrap::after  { right:0; transform:scaleX(-1); }
-      .overlap { background: rgba(244,114,182,.22); }
+      .overlap { background: rgba(244,114,182,.22); }  /* 0~1 범위 */
       .overlap-mark { color:#ec4899; font-weight:800; }
       .close-tail { color:#b8f55a; font-weight:800; }
       .dlbar { display:flex; gap:10px; align-items:center; margin:.6rem 0 .6rem; flex-wrap:wrap; }
@@ -90,6 +86,51 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
 def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
+# 핵심: '다음 청크 앞부분 핑크 제거' — 왼쪽 오버랩은 시각화에서 숨김
+def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, include_head=True) -> str:
+    N=len(text)
+    units=[]
+    if include_front:
+        units += [c for c in chunks if c.meta.get("type")=="front_matter"]
+    if include_head:
+        units += [c for c in chunks if c.meta.get("type")=="headnote"]
+    units += [c for c in chunks if c.meta.get("type") in ("article","article_pack")]
+    units.sort(key=lambda c:(c.span_start,c.span_end))
+
+    parts=[]; cur=0; idx=0
+    for i,c in enumerate(units):
+        s,e=int(c.span_start),int(c.span_end)
+        if s<0 or e>N or e<=s: continue
+        if s>cur: parts.append(_esc(text[cur:s]))
+
+        cs,ce = c.meta.get("core_span",[s,e])
+        if not (isinstance(cs,int) and isinstance(ce,int) and s<=cs<=ce<=e):
+            cs,ce=s,e
+
+        # 왼쪽 오버랩은 칠하지 않는다(겹칸 시각 중복 제거)
+        # → s~cs 구간을 일반 텍스트로 출력
+        parts.append(f'<span class="chunk-wrap" title="{_esc(c.meta.get("section_label","chunk"))}">')
+        parts.append(_esc(text[s:cs]))  # 왼쪽은 normal
+
+        # 코어
+        parts.append(_esc(text[cs:ce]))
+
+        # 오른쪽 오버랩만 핑크로
+        if e>ce:
+            parts.append('<span class="overlap-mark">}</span>')  # 시각적 구분자(닫힘 표식 먼저)
+            parts.append(f'<span class="overlap">{_esc(text[ce:e])}</span>')
+        parts.append("</span>")
+
+        idx+=1
+        brief = (c.meta or {}).get("brief") or _brief_fallback(c, text, 180)
+        tail = f' }} chunk {idx:04d}'
+        if brief:
+            tail += f' — { _esc(brief) }'
+        parts.append(f' <span class="close-tail">{tail}</span><br/>')
+        cur=e
+    if cur<N: parts.append(_esc(text[cur:N]))
+    return '<div class="doc">'+"".join(parts)+"</div>"
+
 def _brief_fallback(chunk: Chunk, full_text: str, max_len: int = 180) -> str:
     s, e = chunk.meta.get("core_span",[chunk.span_start, chunk.span_end])
     if not (isinstance(s,int) and isinstance(e,int) and e>s): s,e = chunk.span_start, chunk.span_end
@@ -105,46 +146,6 @@ def _brief_fallback(chunk: Chunk, full_text: str, max_len: int = 180) -> str:
         brief_max_len=max_len
     )
     return rec.get("brief","")
-
-def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, include_head=True) -> str:
-    N=len(text)
-    units=[]
-    if include_front:
-        units += [c for c in chunks if c.meta.get("type")=="front_matter"]
-    if include_head:
-        units += [c for c in chunks if c.meta.get("type")=="headnote"]
-    units += [c for c in chunks if c.meta.get("type") in ("article","article_pack")]
-    units.sort(key=lambda c:(c.span_start,c.span_end))
-
-    parts=[]; cur=0; idx=0
-    for c in units:
-        s,e=int(c.span_start),int(c.span_end)
-        if s<0 or e>N or e<=s: continue
-        if s>cur: parts.append(_esc(text[cur:s]))
-
-        cs,ce = c.meta.get("core_span",[s,e])
-        if not (isinstance(cs,int) and isinstance(ce,int) and s<=cs<=ce<=e):
-            cs,ce=s,e
-
-        parts.append(f'<span class="chunk-wrap" title="{_esc(c.meta.get("section_label","chunk"))}">')
-        if cs>s:
-            parts.append('<span class="overlap-mark">{</span>')
-            parts.append(f'<span class="overlap">{_esc(text[s:cs])}</span>')
-        parts.append(_esc(text[cs:ce]))
-        if e>ce:
-            parts.append(f'<span class="overlap">{_esc(text[ce:e])}</span>')
-            parts.append('<span class="overlap-mark">}</span>')
-        parts.append("</span>")
-        idx+=1
-
-        brief = (c.meta or {}).get("brief") or _brief_fallback(c, text, 180)
-        tail = f' }} chunk {idx:04d}'
-        if brief:
-            tail += f' — { _esc(brief) }'
-        parts.append(f' <span class="close-tail">{tail}</span><br/>')
-        cur=e
-    if cur<N: parts.append(_esc(text[cur:N]))
-    return '<div class="doc">'+"".join(parts)+"</div>"
 
 class RunPanel:
     def __init__(self):
@@ -214,8 +215,7 @@ def main():
         if not st.session_state["text"]:
             st.warning("먼저 파일을 업로드하세요."); return
 
-        class RunPanelCtx(RunPanel): pass
-        panel = RunPanelCtx()
+        panel = RunPanel()
         try:
             text = st.session_state["text"]; src = st.session_state["source_file"]
 
@@ -271,20 +271,33 @@ def main():
             panel.log(f"현재 청크 {len(chunks)}개 (article {len(arts)})")
             panel.tick("청킹", inc=20)
 
-            # 4) LLM 요약 (배치+캐시+스킵)
+            # 4) LLM 요약 (배치+캐시+스킵) — 사용량/시간 누적 통계
             llm_errors: List[str] = []
             cache: Dict[str, Any] = st.session_state["llm_cache"]
             skip_short = st.session_state["skip_short_chars"]
 
+            stats = {
+                "model": None,
+                "batches": 0,
+                "sections_total": len(arts),
+                "sections_cache_hits": 0,
+                "sections_local_skip": 0,
+                "sections_new_calls": 0,
+                "usage_prompt_tokens": 0,
+                "usage_completion_tokens": 0,
+                "usage_total_tokens": 0,
+                "elapsed_ms_sum": 0,
+                "est_cost_usd": 0.0,
+            }
+
             if st.session_state["use_llm_summary"]:
                 panel.step("4/6 LLM 요약(배치)")
                 pending: List[Tuple[str, Chunk, str]] = []
-                ready_count = 0
                 for idx, c in enumerate(arts, 1):
                     cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
                     core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
                     core = (core or "").strip()
-                    if len(core) <= 0:
+                    if not core:
                         continue
                     key = _sha1(core)
                     if len(core) <= skip_short:
@@ -300,7 +313,7 @@ def main():
                             "brief":rec["brief"],"topics":rec["topics"],"negations":rec["negations"],
                             "summary_text_raw":rec["summary_text_raw"],"quality":rec["quality"],"cache":"local-skip"
                         })
-                        ready_count += 1
+                        stats["sections_local_skip"] += 1
                         continue
                     if key in cache:
                         rec = cache[key]["rec"]
@@ -308,11 +321,12 @@ def main():
                             "brief":rec["brief"],"topics":rec["topics"],"negations":rec["negations"],
                             "summary_text_raw":cache[key]["text"],"quality":rec["quality"],"cache":"hit"
                         })
-                        ready_count += 1
+                        stats["sections_cache_hits"] += 1
                         continue
                     pending.append((f"A{idx:04d}", c, core))
 
-                panel.log(f"스킵/캐시 적용 완료 · 즉시완료 {ready_count} / 대기 {len(pending)}")
+                stats["sections_new_calls"] = len(pending)
+                panel.log(f"스킵/캐시 적용 완료 · cache {stats['sections_cache_hits']} / local-skip {stats['sections_local_skip']} / 대기 {len(pending)}")
 
                 total_batches = math.ceil(len(pending) / st.session_state["batch_group_size"])
                 if st.session_state["max_calls"] and total_batches > st.session_state["max_calls"]:
@@ -328,11 +342,12 @@ def main():
                             "breadcrumbs": " / ".join(ch.breadcrumbs or []),
                             "text": core
                         })
+                    # llm_clients가 usage/ms/model/est_cost_usd를 반환
                     return call_openai_batch(sections, max_tokens=1200, temperature=0.2)
 
-                done_calls = 0
                 workers = max(1, min(8, st.session_state["parallel_calls"]))
                 group = max(2, min(20, st.session_state["batch_group_size"]))
+                done_calls = 0
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futures=[]; cursor=0; future_to_batch={}
@@ -348,6 +363,17 @@ def main():
                         if not r.get("ok"):
                             llm_errors.append(str(r.get("error"))); continue
                         id_map = r.get("map", {})
+                        stats["batches"] += 1
+                        stats["elapsed_ms_sum"] += int(r.get("ms", 0))
+                        if r.get("usage"):
+                            u = r["usage"]
+                            stats["usage_prompt_tokens"] += int(u.get("prompt_tokens",0))
+                            stats["usage_completion_tokens"] += int(u.get("completion_tokens",0))
+                            stats["usage_total_tokens"] += int(u.get("total_tokens",0))
+                        if r.get("est_cost_usd") is not None:
+                            stats["est_cost_usd"] += float(r["est_cost_usd"] or 0.0)
+                        if r.get("model"): stats["model"]=r["model"]
+
                         for bid, ch, core in future_to_batch[fut]:
                             if bid in id_map:
                                 txt = id_map[bid]
@@ -385,10 +411,22 @@ def main():
                         "summary_text_raw":rec["summary_text_raw"],"quality":rec["quality"],"cache":"local-only"
                     })
                 panel.tick("LLM 요약", inc=30)
+                stats = {  # LLM OFF 상태 기록
+                    "model": None, "batches": 0,
+                    "sections_total": len(arts),
+                    "sections_cache_hits": 0,
+                    "sections_local_skip": len(arts),
+                    "sections_new_calls": 0,
+                    "usage_prompt_tokens": 0,
+                    "usage_completion_tokens": 0,
+                    "usage_total_tokens": 0,
+                    "elapsed_ms_sum": 0,
+                    "est_cost_usd": 0.0,
+                }
 
             st.session_state["llm_errors"] = llm_errors
 
-            # 5) REPORT/JSONL (두 가지 형식 동시 생성)
+            # 5) REPORT/JSONL
             panel.step("5/6 리포트/저장")
             cov=_coverage(chunks, len(result.full_text))
             report_str = make_debug_report(
@@ -410,7 +448,11 @@ def main():
                     "tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**(rep_diag or {})},
                     "make_chunks_diag":mk_diag or {},
                     "coverage_calc":{"coverage":cov},
-                    "llm":{"errors":llm_errors, "cache_size":len(st.session_state["llm_cache"])}
+                    "llm":{
+                        "errors":llm_errors,
+                        "cache_size":len(st.session_state["llm_cache"]),
+                        "stats":stats
+                    }
                 }
             )
 
