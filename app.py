@@ -7,19 +7,18 @@ import streamlit as st
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import (
     validate_tree, make_chunks, guess_law_name, repair_tree,
-    merge_small_trailing_parts,  # ★ NEW: 꼬리 병합 패스
+    merge_small_trailing_parts,
 )
 from parser_core.schema import ParseResult, Chunk
 
-# 익스포트
-from exporters.writers import (
+# 익스포트 (경로 교정)
+from writers import (
     to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
 )
 
 # LLM (요약 배치/캐시)
 from llm_clients import call_openai_batch
 from extractors import build_summary_record
-
 
 APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)  (Batch+Cache, Dual Exports + Tail-Sweep)"
 
@@ -81,6 +80,23 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
 def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
+def _brief_fallback(chunk: Chunk, full_text: str, max_len: int = 180) -> str:
+    # meta.brief 없을 때 core_span으로 로컬 규칙 요약 생성
+    s, e = chunk.meta.get("core_span",[chunk.span_start, chunk.span_end])
+    if not (isinstance(s,int) and isinstance(e,int) and e>s): s,e = chunk.span_start, chunk.span_end
+    core = full_text[s:e].strip()
+    if not core: core = (chunk.text or "").strip()
+    if not core: return ""
+    rec = build_summary_record(
+        law_name=chunk.meta.get("law_name",""),
+        section_label=chunk.meta.get("section_label",""),
+        breadcrumbs=chunk.breadcrumbs or [],
+        span=(chunk.span_start, chunk.span_end),
+        llm_text=core,
+        brief_max_len=max_len
+    )
+    return rec.get("brief","")
+
 def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, include_head=True) -> str:
     N=len(text)
     units=[]
@@ -88,7 +104,7 @@ def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, i
         units += [c for c in chunks if c.meta.get("type")=="front_matter"]
     if include_head:
         units += [c for c in chunks if c.meta.get("type")=="headnote"]
-    units += [c for c in chunks if c.meta.get("type")=="article"]
+    units += [c for c in chunks if c.meta.get("type") in ("article","article_pack")]
     units.sort(key=lambda c:(c.span_start,c.span_end))
 
     parts=[]; cur=0; idx=0
@@ -111,7 +127,13 @@ def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, i
             parts.append('<span class="overlap-mark">}</span>')
         parts.append("</span>")
         idx+=1
-        parts.append(f' <span class="close-tail">}} chunk {idx:04d}</span><br/>')
+
+        # 요약: meta.brief가 있으면 사용, 없으면 로컬 규칙 요약 fallback
+        brief = (c.meta or {}).get("brief") or _brief_fallback(c, text, 180)
+        tail = f' }} chunk {idx:04d}'
+        if brief:
+            tail += f' — { _esc(brief) }'
+        parts.append(f' <span class="close-tail">{tail}</span><br/>')
         cur=e
     if cur<N: parts.append(_esc(text[cur:N]))
     return '<div class="doc">'+"".join(parts)+"</div>"
@@ -222,14 +244,21 @@ def main():
             )
             panel.log(f"청크 1차 생성 {len(chunks)}개 · {time.time()-t0:.2f}s")
 
-            # ★ NEW: 분할 시리즈 마지막 꼬리(≤tail_merge_min_chars) 흡수
+            # 꼬리 병합(짧은 마지막 파트 흡수)
             tail_threshold = st.session_state["tail_merge_min_chars"]
             sweep_diag = merge_small_trailing_parts(chunks, full_text=result.full_text, max_tail_chars=tail_threshold)
             if isinstance(mk_diag, dict):
                 mk_diag["micro_sweeper_tail"] = {"max_tail_chars": tail_threshold, **sweep_diag}
             panel.log(f"마이크로 스위퍼 적용 · merged={sweep_diag['merged_count']}")
 
-            arts = [c for c in chunks if c.meta.get("type")=="article"]
+            # 하드캡 진단(진단용: 분할 임계 + 2*overlap + 120 슬랙)
+            hard_cap = st.session_state["split_threshold_chars"] + 2*st.session_state["overlap_chars"] + 120
+            cap_viol = [{"label": (c.meta or {}).get("section_label",""), "len": (c.span_end - c.span_start)}
+                        for c in chunks if (c.span_end - c.span_start) > hard_cap]
+            if isinstance(mk_diag, dict):
+                mk_diag["hard_cap"] = {"cap_chars": hard_cap, "violations": cap_viol, "count": len(cap_viol)}
+
+            arts = [c for c in chunks if c.meta.get("type") in ("article","article_pack")]
             panel.log(f"현재 청크 {len(chunks)}개 (article {len(arts)})")
             panel.tick("청킹", inc=20)
 
@@ -245,7 +274,7 @@ def main():
                 for idx, c in enumerate(arts, 1):
                     cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
                     core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
-                    core = core.strip()
+                    core = (core or "").strip()
                     if len(core) <= 0:
                         continue
                     key = _sha1(core)
@@ -297,10 +326,12 @@ def main():
                 group = max(2, min(20, st.session_state["batch_group_size"]))
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures=[]; cursor=0
+                    futures=[]; cursor=0; future_to_batch={}
                     while cursor < len(pending) and (st.session_state["max_calls"]==0 or done_calls < st.session_state["max_calls"]):
                         batch = pending[cursor: cursor+group]
-                        futures.append(ex.submit(_run_batch, batch))
+                        fut = ex.submit(_run_batch, batch)
+                        futures.append(fut)
+                        future_to_batch[fut] = batch
                         done_calls += 1
                         cursor += group
                     for fut in as_completed(futures):
@@ -308,7 +339,7 @@ def main():
                         if not r.get("ok"):
                             llm_errors.append(str(r.get("error"))); continue
                         id_map = r.get("map", {})
-                        for bid, ch, core in pending:
+                        for bid, ch, core in future_to_batch[fut]:
                             if bid in id_map:
                                 txt = id_map[bid]
                                 rec = build_summary_record(
@@ -397,7 +428,7 @@ def main():
     # ---------- 표시/다운로드 ----------
     if st.session_state["parsed"]:
         cov=_coverage(st.session_state["chunks"], len(st.session_state["result"].full_text))
-        arts=[c for c in st.session_state["chunks"] if c.meta.get("type")=="article"]
+        arts=[c for c in st.session_state["chunks"] if c.meta.get("type") in ("article","article_pack")]
         st.write(
             f"**파일:** {st.session_state['source_file']}  |  "
             f"**doc_type:** {st.session_state.get('doc_type','unknown')}  |  "

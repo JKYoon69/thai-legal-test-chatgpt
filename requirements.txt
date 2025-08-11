@@ -6,8 +6,8 @@ regex
 # OpenAI (Responses API; output_text/structured outputs 지원)
 openai>=1.40,<2
 
-# Google Gemini - 신규 SDK (임포트: from google import genai)
-google-genai>=0.3
+# Google Gemini (신규 공식 SDK; import: import google.generativeai as genai)
+google-generativeai>=0.7.2
 
 # JSON 스키마 검증
 jsonschema>=4.20
