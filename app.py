@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import time, json, math, os, sys, re
+import os, sys, re, time, json, math
 from typing import List, Dict, Any, Tuple, Optional
 import streamlit as st
 
@@ -86,88 +86,119 @@ def _coverage(chunks: List[Chunk], total_len: int) -> float:
 def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-# ---------- 경계 스냅(번호머리 앵커) ----------
+# ---------- 번호머리 앵커 탐지(줄머리) ----------
 # 타이 숫자 범위: \u0E50-\u0E59 (๐–๙)
 ENUM_PATTERNS = [
-    re.compile(r'^\s*[\(\[\{]?\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*[\)\]\}]?\s*'),  # (16) / 16) / ๑๖)
-    re.compile(r'^\s*(?:ข้อ|มาตรา)\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*'),           # ข้อ 12 / มาตรา 5
-    re.compile(r'^\s*(?:•|·|-|—|–)\s+'),                                             # 불릿
+    ("digit", re.compile(r'^\s*[\(\[\{]?\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*[\)\]\}]?\s*')),  # (16) / 16) / ๑๖)
+    ("lawterm", re.compile(r'^\s*(?:ข้อ|มาตรา)\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*')),        # ข้อ 12 / มาตรา 5
+    ("bullet", re.compile(r'^\s*(?:•|·|-|—|–)\s+')),                                            # 불릿
 ]
 
-def _match_enum_at(text: str, pos: int, lookbehind: int = 12, lookahead: int = 50) -> Optional[Tuple[int,int]]:
+def _line_start(text: str, pos: int) -> int:
+    lb = text.rfind("\n", 0, pos)
+    return 0 if lb < 0 else lb + 1
+
+def _detect_enum_anchor_at_chunk_start(text: str, s_next: int, lookahead: int = 60) -> Optional[Tuple[int,int,str]]:
     """
-    pos 주변(앞 12, 뒤 50)에서 번호머리/불릿을 '선두'로 매칭.
-    반환: (abs_start, abs_end) 또는 None
+    다음 청크 시작 s_next 기준 '줄머리'에서 번호머리/불릿 패턴을 찾는다.
+    반환: (enum_start_abs, enum_end_abs, kind) 또는 None
     """
     N = len(text)
-    a = max(0, pos - lookbehind)
-    b = min(N, pos + lookahead)
-    sub = text[a:b]
-    for rx in ENUM_PATTERNS:
-        m = rx.match(sub)
+    ls = _line_start(text, s_next)
+    b = min(N, s_next + lookahead)
+    seg = text[ls:b]
+    for kind, rx in ENUM_PATTERNS:
+        m = rx.match(seg)
         if m:
-            return (a + m.start(), a + m.end())
+            return (ls + m.start(), ls + m.end(), kind)
     return None
+
+def _refresh_text(c: Chunk, full_text: str) -> None:
+    c.text = full_text[int(c.span_start):int(c.span_end)]
 
 def normalize_enumeration_boundaries(chunks: List[Chunk], full_text: str) -> Dict[str, Any]:
     """
-    번호머리/불릿을 경계 앵커로 보고:
-    - 다음 청크(core 시작) 앞의 번호머리가 이전 청크 '오른쪽 오버랩'에 끼어있으면 잘라낸다.
-    - 다음 청크 core 시작이 번호머리 '뒤'라면, 번호머리 '앞'으로 core 시작을 당겨서 포함한다.
-    무손실 유지(coverage 보장), overlap_left/right 재계산.
+    번호머리/불릿을 경계 앵커로 보고, '청크 쌍' 단위로 보정한다.
+    - 기준: 다음 청크의 시작(s_next)의 '줄머리'에서 앵커 매칭
+    - 이전 청크 오른쪽 오버랩에서 번호머리를 제거(prev.span_end = enum_start)
+    - 다음 청크 core 시작은 번호머리 포함(core_start = max(s_next, enum_start))
+    - 이동량 과도(>120자)이면 안전상 미적용
+    - 적용 시 prev.text를 실제 스팬에 맞게 갱신(compat/rich 일치성 확보)
     """
-    diag = {"cuts_prev_overlap": 0, "shifted_core_start": 0, "samples": []}
+    diag = {
+        "pairs_seen": 0, "hits": 0, "cut_only": 0, "shift_only": 0, "both": 0,
+        "pattern_hits": {"digit":0,"lawterm":0,"bullet":0},
+        "moved_chars_hist": [],
+        "samples": []
+    }
     if not chunks: return diag
 
-    # 정렬 보장
-    chunks.sort(key=lambda c:(int(c.span_start), int(c.span_end)))
+    # 기사/팩만 대상으로 정렬
+    units = [c for c in chunks if (c.meta or {}).get("type") in ("article","article_pack")]
+    units.sort(key=lambda c:(int(c.span_start), int(c.span_end)))
 
-    for i in range(len(chunks)):
-        c = chunks[i]
-        ctype = (c.meta or {}).get("type") or "article"
-        if ctype not in ("article", "article_pack"):  # 핵심 구간만 처리
+    for i in range(1, len(units)):
+        prev = units[i-1]; cur = units[i]
+        diag["pairs_seen"] += 1
+
+        s_next = int(cur.span_start)
+        hit = _detect_enum_anchor_at_chunk_start(full_text, s_next)
+        if not hit:
+            continue
+        enum_s, enum_e, kind = hit
+
+        # 이동량 과도하면 skip
+        move_prev = abs(int(prev.span_end) - enum_s)
+        move_cur  = abs(enum_s - max(int(cur.span_start), int((cur.meta or {}).get("core_span",[cur.span_start,cur.span_end])[0])))
+        if move_prev > 120 and move_cur > 120:
             continue
 
-        # 현재 core span
-        cs, ce = (c.meta or {}).get("core_span", [c.span_start, c.span_end])
-        if not (isinstance(cs,int) and isinstance(ce,int) and c.span_start <= cs <= ce <= c.span_end):
-            cs, ce = c.span_start, c.span_end
+        applied_cut=False; applied_shift=False
 
-        # cs 주변에 번호머리 존재?
-        hit = _match_enum_at(full_text, cs)
-        if hit:
-            enum_s, enum_e = hit
+        # 1) 이전 청크 오른쪽 절단 (번호머리 제외)
+        if int(prev.span_end) > enum_s and enum_s >= int(prev.span_start):
+            prev.span_end = enum_s
+            # core_span 보정
+            pcs, pce = (prev.meta or {}).get("core_span", [prev.span_start, prev.span_end])
+            if pce > prev.span_end: pce = prev.span_end
+            if pcs < prev.span_start: pcs = prev.span_start
+            prev.meta["core_span"] = [int(pcs), int(pce)]
+            prev.meta["overlap_right"] = max(0, int(prev.span_end) - int(pce))
+            _refresh_text(prev, full_text)
+            applied_cut=True
 
-            # 1) core 시작이 번호머리 '뒤'라면, core 시작을 번호머리 '앞'으로 이동
-            if enum_s < cs <= enum_e + 2:  # cs가 번호머리 직후라면 포함시키자
-                cs_new = enum_s
-                if cs_new < cs:
-                    c.meta["core_span"] = [cs_new, ce]
-                    # overlap_left 재계산
-                    c.meta["overlap_left"] = max(0, cs_new - c.span_start)
-                    diag["shifted_core_start"] += 1
+        # 2) 다음 청크 core 시작을 번호머리 포함으로
+        cs, ce = (cur.meta or {}).get("core_span", [cur.span_start, cur.span_end])
+        cs0 = int(cs); ce0 = int(ce)
+        s0 = int(cur.span_start)
+        cs_new = max(s0, enum_s)
+        if cs_new < cs0:
+            cur.meta["core_span"] = [cs_new, ce0]
+            cur.meta["overlap_left"] = max(0, cs_new - s0)
+            applied_shift=True
 
-            # 2) 이전 청크의 오른쪽 오버랩에 번호머리가 끼어있으면 잘라낸다
-            if i > 0:
-                prev = chunks[i-1]
-                if prev.span_end > enum_s:
-                    prev.span_end = enum_s  # 번호머리 앞에서 종료
-                    pcs, pce = (prev.meta or {}).get("core_span", [prev.span_start, prev.span_end])
-                    if prev.span_end < pce:
-                        pce = prev.span_end
-                    prev.meta["core_span"] = [pcs, pce]
-                    prev.meta["overlap_right"] = max(0, prev.span_end - pce)
-                    diag["cuts_prev_overlap"] += 1
-                    if len(diag["samples"]) < 5:
-                        diag["samples"].append({
-                            "next_section": (c.meta or {}).get("section_label",""),
-                            "enum": full_text[enum_s:enum_e]
-                        })
+        if applied_cut or applied_shift:
+            diag["hits"] += 1
+            diag["pattern_hits"][kind] = diag["pattern_hits"].get(kind,0) + 1
+            if applied_cut and applied_shift: diag["both"] += 1
+            elif applied_cut: diag["cut_only"] += 1
+            elif applied_shift: diag["shift_only"] += 1
+            mv = 0
+            if applied_cut: mv += move_prev
+            if applied_shift: mv += move_cur
+            diag["moved_chars_hist"].append(min(mv, 400))
+            if len(diag["samples"]) < 5:
+                diag["samples"].append({
+                    "next_section": (cur.meta or {}).get("section_label",""),
+                    "enum": full_text[enum_s:enum_e],
+                    "cut_prev_to": enum_s,
+                    "shift_core_to": cur.meta["core_span"][0]
+                })
 
     return diag
 
 # ---------- 시각화 ----------
-# 왼쪽 겹침은 일반 텍스트, 오른쪽 겹침만 핑크. `}` 표식은 핑크 '뒤'에 둔다.
+# 왼쪽 겹침은 일반 텍스트, 오른쪽 겹침만 핑크. `}` 표식은 핑크 '뒤'. 짧은 겹침(≤4자)은 `}` 생략.
 def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, include_head=True) -> str:
     N=len(text)
     units=[]
@@ -195,8 +226,10 @@ def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, i
         parts.append(_esc(text[cs:ce]))
         # 오른쪽 겹침만 핑크 + 표식은 핑크 '뒤'
         if e>ce:
-            parts.append(f'<span class="overlap">{_esc(text[ce:e])}</span>')
-            parts.append('<span class="overlap-mark">}</span>')
+            over_txt = text[ce:e]
+            parts.append(f'<span class="overlap">{_esc(over_txt)}</span>')
+            if (e - ce) > 4:
+                parts.append('<span class="overlap-mark">}</span>')
         parts.append("</span>")
 
         idx+=1
@@ -338,13 +371,13 @@ def main():
                 mk_diag["micro_sweeper_tail"] = {"max_tail_chars": tail_threshold, **sweep_diag}
             panel.log(f"마이크로 스위퍼 적용 · merged={sweep_diag['merged_count']}")
 
-            # 3.6) 번호머리 경계 스냅(근본 정리)
+            # 3.6) 번호머리 경계 스냅(쌍 단위)
             enum_diag = normalize_enumeration_boundaries(chunks, full_text=result.full_text)
             if isinstance(mk_diag, dict):
                 mk_diag["enum_boundary"] = enum_diag
-            panel.log(f"경계 스냅 · cut_prev_overlap={enum_diag['cuts_prev_overlap']}, shift_core={enum_diag['shifted_core_start']}")
+            panel.log(f"경계 스냅 · pairs={enum_diag['pairs_seen']}, hits={enum_diag['hits']}")
 
-            # 하드캡 진단(분할 임계 + 2*overlap + 120)
+            # 하드캡 진단
             hard_cap = st.session_state["split_threshold_chars"] + 2*st.session_state["overlap_chars"] + 120
             cap_viol = [{"label": (c.meta or {}).get("section_label",""), "len": (c.span_end - c.span_start)}
                         for c in chunks if (c.span_end - c.span_start) > hard_cap]
@@ -376,7 +409,7 @@ def main():
 
             if st.session_state["use_llm_summary"]:
                 panel.step("4/6 LLM 요약(배치)")
-                pending: List[Tuple[str, Chunk, str]] = []
+                pending = []
                 for idx, c in enumerate(arts, 1):
                     cs,ce = c.meta.get("core_span",[c.span_start, c.span_end])
                     core = result.full_text[cs:ce] if (isinstance(cs,int) and isinstance(ce,int) and ce>cs) else c.text
@@ -420,12 +453,8 @@ def main():
                 def _run_batch(batch_items):
                     sections = []
                     for bid, ch, core in batch_items:
-                        sections.append({
-                            "id": bid,
-                            "title": ch.meta.get("section_label",""),
-                            "breadcrumbs": " / ".join(ch.breadcrumbs or []),
-                            "text": core
-                        })
+                        sections.append({"id": bid, "title": ch.meta.get("section_label",""),
+                                         "breadcrumbs": " / ".join(ch.breadcrumbs or []), "text": core})
                     return call_openai_batch(sections, max_tokens=1200, temperature=0.2)
 
                 workers = max(1, min(8, st.session_state["parallel_calls"]))
@@ -509,6 +538,17 @@ def main():
 
             st.session_state["llm_errors"] = llm_errors
 
+            # 파생지표 계산(Report에 같이 적재)
+            def _safe_div(a, b): return (a / b) if (b and b != 0) else 0.0
+            derived = {
+                "avg_tokens_per_section": _safe_div(stats["usage_total_tokens"], max(1, stats["sections_new_calls"])),
+                "avg_ms_per_batch": round(_safe_div(stats["elapsed_ms_sum"], max(1, stats["batches"])), 2),
+                "sections_per_second": round(_safe_div(stats["sections_new_calls"], stats["elapsed_ms_sum"]/1000.0 if stats["elapsed_ms_sum"] else 0), 3),
+                "effective_unit_cost_per_1k": round(_safe_div(stats["est_cost_usd"], (stats["usage_total_tokens"]/1000.0) if stats["usage_total_tokens"] else 0), 6) if stats["usage_total_tokens"] else None,
+                "pricing_source": "derived_effective"
+            }
+            stats.update({"derived": derived})
+
             # 5) REPORT/JSONL
             panel.step("5/6 리포트/저장")
             cov=_coverage(chunks, len(result.full_text))
@@ -531,11 +571,7 @@ def main():
                     "tree_repair":{"issues_before":len(issues_before),"issues_after":len(issues_after),**(rep_diag or {})},
                     "make_chunks_diag":mk_diag or {},
                     "coverage_calc":{"coverage":cov},
-                    "llm":{
-                        "errors":llm_errors,
-                        "cache_size":len(st.session_state["llm_cache"]),
-                        "stats":stats
-                    }
+                    "llm":{"errors":llm_errors, "cache_size":len(st.session_state["llm_cache"]), "stats":stats}
                 }
             )
 
