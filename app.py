@@ -2,23 +2,26 @@
 """
 Thai Legal Preprocessor — RAG-ready (lossless + debug)
 
-안전한 변경점 요약
-- 기존 구조 문서(หมวด/ส่วน/มาตรา 등 존재): 기존 파이프라인 그대로 동작.
-- 구조 신호 거의 없음: 자동 '구조-프리(fallback) 청킹' 발동(단락/길이 기반 분할).
-- 번호머리(예: (16)/ข้อ/มาตรา/불릿) 경계 스냅 + 커버리지 틈 방지 유지.
-- 0-길이 청크 자동 정리.
-- UI/겹침표시/LLM 토큰·비용 REPORT 동일.
+Safe changes / what's new:
+- English UI.
+- One-click "Download All" (ZIP with rich.jsonl, compat.jsonl, REPORT.json).
+- "New File" button resets the whole app state and uploader.
+- Structure-free fallback chunking (paragraph+length) for structureless docs only.
+- Enumeration boundary snap with coverage repair + label/UID reconciliation when anchors disagree.
+- Zero-length cleanup; overlap visualization; LLM usage/cost in REPORT.
+- Mode flag ("structured" | "fallback") recorded in report.
 """
-import os, sys, re, time, json, math
+
+import os, sys, re, time, json, math, io, zipfile, hashlib, random
 from typing import List, Dict, Any, Tuple, Optional
 import streamlit as st
 
-# --- 경로 보정 ---
+# --- Path fix ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
-# 파서/후처리
+# Parser / chunker core
 from parser_core.parser import detect_doc_type, parse_document
 from parser_core.postprocess import (
     validate_tree, make_chunks, guess_law_name, repair_tree,
@@ -26,24 +29,23 @@ from parser_core.postprocess import (
 )
 from parser_core.schema import ParseResult, Chunk
 
-# 익스포트 (writers 위치 호환)
+# Writers (compatibility import path)
 try:
     from writers import to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
 except ModuleNotFoundError:
     from exporters.writers import to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
 
-# LLM (요약 배치/캐시)
+# LLM (batch + cache)
 from llm_clients import call_openai_batch
 from extractors import build_summary_record
 
 APP_TITLE = "Thai Legal Preprocessor — RAG-ready (lossless + debug)"
 
-# ---------- 유틸 ----------
+# ----------------------- Utilities -----------------------
 def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 def _sha1(s: str) -> str:
-    import hashlib
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 def _coverage(chunks: List, total_len: int) -> float:
@@ -55,9 +57,27 @@ def _coverage(chunks: List, total_len: int) -> float:
     covered=sum(e-s for s,e in merged)
     return (covered/total_len) if total_len else 0.0
 
-# ---------- Fallback Chunk (구조-프리) ----------
+def _basename_no_ext(name: str) -> str:
+    base = name or "document"
+    if "." in base: base = base.rsplit(".",1)[0]
+    return base
+
+def _normalize_law_name(name: Optional[str], fallback_filename: str) -> str:
+    """Tighten weird spacing and backfill from filename if it looks too short."""
+    if not name: name = ""
+    # collapse weird Thai spacing artifacts
+    name = re.sub(r"\s+", " ", name).strip()
+    # if name too short, fall back to filename (minus extension)
+    if len(name) < 6:
+        name = _basename_no_ext(fallback_filename)
+    # ensure year / ฉบับที่ kept contiguous
+    name = re.sub(r"(พ\.ศ\.)\s+(\d{4})", r"\1 \2", name)
+    name = re.sub(r"(ฉบับที่)\s+(\d+)", r"\1 \2", name)
+    return name
+
+# ----------------------- Fallback chunking -----------------------
 class SimpleChunk:
-    """Duck-typed Chunk: writers/exporters가 접근하는 속성만 구현"""
+    """Duck-typed Chunk enough for writers/exporters."""
     def __init__(self, text: str, span_start: int, span_end: int, meta: Dict[str,Any], breadcrumbs: Optional[List[str]]=None):
         self.text = text
         self.span_start = span_start
@@ -67,65 +87,93 @@ class SimpleChunk:
 
 def _paragraph_breaks(text: str) -> List[int]:
     """
-    단락 경계 후보: 빈 줄(연속 개행) 기준. 없으면 한 줄 개행도 후보로.
-    반환: 절대 오프셋 리스트(코어 종료 후보).
+    Paragraph break candidates: empty lines (double newlines). If none, allow single newline.
+    Returns absolute offsets (core end candidates).
     """
     N = len(text)
     brks = set()
     for m in re.finditer(r'(?:\r?\n[ \t\f\v]*\r?\n)+', text):
         brks.add(m.end())
-    # 단락이 전혀 없다면, 한 줄 개행도 후보로
     if not brks:
         for m in re.finditer(r'\r?\n', text):
             brks.add(m.end())
     brks.add(N)
     return sorted(brks)
 
-def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
-                        target_chars: int, min_chars: int, overlap_chars: int,
-                        tail_merge_min_chars: int) -> Tuple[List[SimpleChunk], Dict[str,Any]]:
+def _second_cut_candidates(seg: str) -> List[int]:
     """
-    구조가 없는 문서를 길이 기반으로 안전 분할.
-    - 우선 단락 경계를 최대한 활용
-    - 없으면 하드 컷(최대 target_chars) + 좌/우 오버랩
-    - 마지막 조각이 너무 짧으면 앞 조각과 병합
+    Optional inner split hints for very long paragraphs:
+    - list items like '1) ', 'ข้อ 3', bullets
+    - punctuation hints like ';' or ':' followed by newline/space
+    Returns list of local offsets (within seg) where a cut could happen.
+    """
+    cand = set()
+    # list numbers or Thai article indicators
+    for m in re.finditer(r'(?m)^(?:\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\)\s+|(?:ข้อ|มาตรา)\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\b|[•·\-–—]\s+)', seg):
+        cand.add(m.start())
+    # punctuation hints
+    for m in re.finditer(r'[;:]\s+(?=\S)', seg):
+        cand.add(m.end())
+    return sorted(cand)
+
+def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
+                        target_chars: int, min_ratio: float, overlap_chars: int,
+                        tail_merge_min_chars: int, enable_second_cut: bool=True) -> Tuple[List[SimpleChunk], Dict[str,Any]]:
+    """
+    Structure-free length-based split:
+    - Prefer paragraph boundaries within [pos+min, pos+target]
+    - If not available, extend search window slightly; otherwise hard-cut
+    - Optional second-cut hints inside very long paragraphs
+    - Tail merge if last piece too short
     """
     N = len(full_text)
     breaks = _paragraph_breaks(full_text)
-    cores = []
+    cores: List[Tuple[int,int]] = []
     pos = 0
+    min_chars = max(200, int(target_chars * min_ratio))
+    ext = 160  # extra window to find a nice boundary
 
     while pos < N:
-        # 후보 경계: [pos+min_chars, pos+target_chars] 구간 내 가장 먼 경계
         lo = pos + min_chars
         hi = min(N, pos + target_chars)
         cand = [b for b in breaks if lo <= b <= hi]
+        cut = None
         if cand:
             cut = max(cand)
         else:
-            # 여유 범위(hi+200)까지 확장해서라도 경계에 맞춰 자르기
-            ext_hi = min(N, hi + 200)
+            # try extended window
+            ext_hi = min(N, hi + ext)
             cand2 = [b for b in breaks if hi < b <= ext_hi]
             cut = (min(N, pos + target_chars) if not cand2 else min(max(cand2), N))
-        if cut <= pos:
+
+        if cut is None or cut <= pos:
             cut = min(N, pos + target_chars)
-            if cut <= pos:  # 안전장치
+            if cut <= pos:
                 break
+
+        # Optional inner hint to avoid overly long paragraph cores
+        if enable_second_cut and (cut - pos) > int(1.25 * target_chars):
+            local = full_text[pos:cut]
+            hints = _second_cut_candidates(local)
+            # choose the furthest hint after min_chars but before target_chars if possible
+            good = [pos + h for h in hints if (pos + h) >= lo and (pos + h) <= (pos + target_chars)]
+            if good:
+                cut = max(good)
+
         cores.append((pos, cut))
         pos = cut
 
-    # tail 병합
+    # tail merge
     if len(cores) >= 2 and (cores[-1][1] - cores[-1][0]) < tail_merge_min_chars:
         cores[-2] = (cores[-2][0], cores[-1][1])
         cores.pop()
 
     chunks: List[SimpleChunk] = []
     for i,(cs,ce) in enumerate(cores, start=1):
-        # 오버랩 적용
         s = max(0, cs - (overlap_chars if i>1 else 0))
         e = min(N, ce + (overlap_chars if i < len(cores) else 0))
         meta = {
-            "type": "article",  # 다운스트림 호환을 위해 article로 둠
+            "type": "article",  # downstream compatibility
             "law_name": law_name or "",
             "source_file": source_file or "",
             "section_label": f"part {i}",
@@ -142,27 +190,26 @@ def make_generic_chunks(full_text: str, *, law_name: str, source_file: str,
         "made": True, "strategy":"paragraph+length",
         "cores": len(cores), "chunks": len(chunks),
         "target_chars": target_chars, "min_chars": min_chars, "overlap_chars": overlap_chars,
-        "tail_merge_min_chars": tail_merge_min_chars
+        "tail_merge_min_chars": tail_merge_min_chars, "second_cut": bool(enable_second_cut)
     }
     return chunks, diag
 
-# ---------- 번호머리 앵커 스냅 + 커버리지 복구 ----------
-# 타이 숫자 범위: \u0E50-\u0E59 (๐–๙)
+# ----------------------- Enumeration snap + label reconciliation -----------------------
+# Thai digits range: \u0E50-\u0E59
 ENUM_PATTERNS = [
     ("digit", re.compile(r'^\s*[\(\[\{]?\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*[\)\]\}]?\s*')),
     ("lawterm", re.compile(r'^\s*(?:ข้อ|มาตรา)\s*(?:\d{1,4}|[\u0E50-\u0E59]{1,4})\s*')),
     ("bullet", re.compile(r'^\s*(?:•|·|-|—|–)\s+')),
 ]
 
+THAI_DIGITS = {ord('๐'): '0', ord('๑'): '1', ord('๒'): '2', ord('๓'): '3', ord('๔'): '4',
+               ord('๕'): '5', ord('๖'): '6', ord('๗'): '7', ord('๘'): '8', ord('๙'): '9'}
+
 def _line_start(text: str, pos: int) -> int:
     lb = text.rfind("\n", 0, pos)
     return 0 if lb < 0 else lb + 1
 
 def _detect_enum_anchor_at_chunk_start(text: str, s_next: int, lookahead: int = 80) -> Optional[Tuple[int,int,str]]:
-    """
-    다음 청크 시작 s_next 기준 '줄머리'에서 번호머리/불릿 패턴을 찾는다.
-    반환: (enum_start_abs, enum_end_abs, kind) 또는 None
-    """
     N = len(text)
     ls = _line_start(text, s_next)
     b = min(N, s_next + lookahead)
@@ -176,21 +223,32 @@ def _detect_enum_anchor_at_chunk_start(text: str, s_next: int, lookahead: int = 
 def _refresh_text(c, full_text: str) -> None:
     c.text = full_text[int(c.span_start):int(c.span_end)]
 
-def normalize_enumeration_boundaries(chunks, full_text: str) -> Dict[str, Any]:
+def _parse_anchor_label(anchor_text: str) -> Optional[str]:
+    """Return normalized section label like 'มาตรา 12' or 'ข้อ 3' if detectable."""
+    t = anchor_text.strip()
+    m = re.match(r'^(ข้อ|มาตรา)\s*([\d\u0E50-\u0E59]{1,4})', t)
+    if not m:
+        return None
+    head = m.group(1)
+    num = m.group(2).translate(THAI_DIGITS)
+    return f"{head} {num}"
+
+def normalize_enumeration_boundaries(chunks, full_text: str, *, reconcile_labels: bool=True) -> Dict[str, Any]:
     """
-    번호머리/불릿을 경계 앵커로 보고, '청크 쌍' 단위로 보정한다.
-    - prev.span_end = enum_start (번호머리 앞에서 종료)
-    - next.span_start = enum_start (틈 제거)
-    - next.core_start = enum_start (번호머리를 코어에 포함)
-    - 이동량 과도(>120자)이면 안전상 미적용
+    Use enumeration/bullet anchors on the next-chunk line start:
+    - prev.span_end = enum_start  (trim tail before the anchor)
+    - next.span_start = enum_start (close gaps)
+    - next.core_span[0] = enum_start (include anchor into core)
+    - (optional) reconcile next.meta.section_label with the anchor
     """
     diag = {
         "pairs_seen": 0, "hits": 0, "cut_only": 0, "shift_only": 0, "both": 0,
         "pattern_hits": {"digit":0,"lawterm":0,"bullet":0},
-        "moved_chars_hist": [], "adjusted_next_start": 0, "core_moved_to_enum": 0, "samples": []
+        "moved_chars_hist": [], "adjusted_next_start": 0, "core_moved_to_enum": 0,
+        "label_mismatch_fixed": 0, "label_samples": []
     }
     if not chunks: return diag
-    # 대상 정렬
+
     units = [c for c in chunks if (c.meta or {}).get("type") in ("article","article_pack")]
     units.sort(key=lambda c:(int(c.span_start), int(c.span_end)))
 
@@ -213,7 +271,7 @@ def normalize_enumeration_boundaries(chunks, full_text: str) -> Dict[str, Any]:
 
         applied_cut=False; applied_shift=False; applied_next_start=False
 
-        # 1) 이전 청크 오른쪽 절단 (번호머리 제외)
+        # 1) trim previous tail
         if int(prev.span_end) > enum_s >= int(prev.span_start):
             prev.span_end = enum_s
             pcs, pce = (prev.meta or {}).get("core_span", [int(prev.span_start), int(prev.span_end)])
@@ -224,14 +282,14 @@ def normalize_enumeration_boundaries(chunks, full_text: str) -> Dict[str, Any]:
             _refresh_text(prev, full_text)
             applied_cut=True
 
-        # 2) 다음 청크 시작을 enum_s로 당김 (틈 제거)
+        # 2) shift next.start to enum_s
         if enum_s < int(cur.span_start):
             cur.span_start = enum_s
             _refresh_text(cur, full_text)
             diag["adjusted_next_start"] += 1
             applied_next_start=True
 
-        # 3) 다음 청크 core 시작을 enum_s로 이동(번호머리 포함)
+        # 3) include anchor into next.core
         cs, ce = (cur.meta or {}).get("core_span", [int(cur.span_start), int(cur.span_end)])
         cs_new = enum_s
         if cs_new < int(cs):
@@ -239,6 +297,29 @@ def normalize_enumeration_boundaries(chunks, full_text: str) -> Dict[str, Any]:
             cur.meta["overlap_left"] = max(0, int(cs_new) - int(cur.span_start))
             applied_shift=True
             diag["core_moved_to_enum"] += 1
+
+        # 4) optional: reconcile label with anchor
+        if reconcile_labels and kind == "lawterm":
+            anchor_label = _parse_anchor_label(full_text[enum_s:enum_e] or "")
+            if anchor_label:
+                old_label = (cur.meta or {}).get("section_label","")
+                if old_label.strip() != anchor_label.strip():
+                    # keep history
+                    prev_labels = (cur.meta or {}).get("prev_labels", [])
+                    if old_label and old_label not in prev_labels:
+                        prev_labels = prev_labels + [old_label]
+                    cur.meta["prev_labels"] = prev_labels
+                    # set new label and UID
+                    cur.meta["section_label"] = anchor_label
+                    # keep part suffix if existed, e.g., "(part 2)"
+                    m = re.search(r"\(part\s*\d+\)", old_label)
+                    if m:
+                        cur.meta["section_label"] += f" {m.group(0)}"
+                    uid_suffix = cur.meta.get("core_span",[int(cur.span_start), int(cur.span_end)])[0]
+                    cur.meta["section_uid"] = f"{cur.meta['section_label']}|{uid_suffix}"
+                    diag["label_mismatch_fixed"] += 1
+                    if len(diag["label_samples"]) < 5:
+                        diag["label_samples"].append({"old": old_label, "new": cur.meta["section_label"]})
 
         if applied_cut or applied_shift or applied_next_start:
             diag["hits"] += 1
@@ -252,37 +333,25 @@ def normalize_enumeration_boundaries(chunks, full_text: str) -> Dict[str, Any]:
             if applied_shift: mv += move_cur_core
             if applied_next_start: mv += move_cur_start
             diag["moved_chars_hist"].append(min(mv, 400))
-            if len(diag["samples"]) < 5:
-                diag["samples"].append({
-                    "next_section": (cur.meta or {}).get("section_label",""),
-                    "enum": full_text[enum_s:enum_e],
-                    "cut_prev_to": int(prev.span_end),
-                    "new_next_start": int(cur.span_start),
-                    "new_core_start": int(cur.meta["core_span"][0])
-                })
+
     return diag
 
 def fix_zero_length_and_gaps(chunks: List, full_text: str) -> Dict[str, Any]:
     """
-    스냅/절단 후 발생한 0-길이 청크 정리 및 틈 방지.
-    - span_end <= span_start 인 청크를 제거
-    - 제거 직전, 다음 청크가 존재하고 next.span_start > this.span_start 이면 next.span_start를 끌어당겨 공백 흡수
+    Clean zero-length chunks and pull next.start back to cover potential gaps left by snapping.
     """
     diag = {"removed_zero_span":0, "fixed_next_start":0, "removed_labels":[]}
-    # 정렬 보장
     chunks.sort(key=lambda c:(int(c.span_start), int(c.span_end)))
     i=0
     while i < len(chunks):
         c = chunks[i]
         s,e = int(c.span_start), int(c.span_end)
         if e <= s:
-            # 다음 청크로 틈 메우기
             if i+1 < len(chunks):
                 nxt = chunks[i+1]
                 if int(nxt.span_start) > s:
                     nxt.span_start = s
                     _refresh_text(nxt, full_text)
-                    # overlap_left 재계산
                     cs, ce = (nxt.meta or {}).get("core_span", [int(nxt.span_start), int(nxt.span_end)])
                     nxt.meta["overlap_left"] = max(0, int(cs) - int(nxt.span_start))
                     diag["fixed_next_start"] += 1
@@ -293,7 +362,7 @@ def fix_zero_length_and_gaps(chunks: List, full_text: str) -> Dict[str, Any]:
         i+=1
     return diag
 
-# ---------- 시각화 ----------
+# ----------------------- Visualization -----------------------
 def _inject_css():
     st.markdown("""
     <style>
@@ -312,10 +381,12 @@ def _inject_css():
       .overlap-mark { color:#ec4899; font-weight:800; }
       .close-tail { color:#b8f55a; font-weight:800; }
       .dlbar { display:flex; gap:10px; align-items:center; margin:.6rem 0 .6rem; flex-wrap:wrap; }
-      .parse-line { margin:.25rem 0 .6rem; }
+      .parse-line { margin:.25rem 0 .6rem; display:flex; gap:.5rem; }
       .parse-line button { background:#22c55e !important; color:#fff !important; border:0 !important;
-                           padding:.75rem 1.2rem !important; font-weight:800 !important; font-size:16px !important;
-                           border-radius:10px !important; width:100%; }
+                           padding:.6rem 1rem !important; font-weight:800 !important; font-size:15px !important;
+                           border-radius:10px !important; }
+      .danger { background:#ef4444 !important; }
+      .accent { background:#3b82f6 !important; }
       .badge-warn { display:inline-block; padding:2px 8px; border-radius:8px; background:#fee2e2; color:#b91c1c; font-weight:700; }
       .muted { color:#9ca3af; font-size:12px; }
       .kv { font-size:12.5px; color:#93c5fd; }
@@ -343,12 +414,9 @@ def render_with_overlap(text: str, chunks: List, *, include_front=True, include_
             cs,ce=s,e
 
         parts.append(f'<span class="chunk-wrap" title="{_esc((c.meta or {}).get("section_label","chunk"))}">')
-        # 왼쪽 겹침은 일반 텍스트
-        parts.append(_esc(text[s:cs]))
-        # 코어
-        parts.append(_esc(text[cs:ce]))
-        # 오른쪽 겹침만 핑크 + 표식은 핑크 '뒤'
-        if e>ce:
+        parts.append(_esc(text[s:cs]))               # left overlap (plain)
+        parts.append(_esc(text[cs:ce]))              # core
+        if e>ce:                                     # right overlap (pink)
             over_txt = text[ce:e]
             parts.append(f'<span class="overlap">{_esc(over_txt)}</span>')
             if (e - ce) > 4:
@@ -358,7 +426,6 @@ def render_with_overlap(text: str, chunks: List, *, include_front=True, include_
         idx+=1
         brief = (c.meta or {}).get("brief")
         if not brief:
-            # 간단 브리프 (코어 앞 180자)
             brief = (text[cs: min(ce, cs+180)] or "").replace("\n"," ").strip()
         tail = f' }} chunk {idx:04d}'
         if brief:
@@ -368,30 +435,44 @@ def render_with_overlap(text: str, chunks: List, *, include_front=True, include_
     if cur<N: parts.append(_esc(text[cur:N]))
     return '<div class="doc">'+"".join(parts)+"</div>"
 
-# ---------- 앱 상태 ----------
-def _ensure_state():
-    defaults = {
+# ----------------------- App state -----------------------
+def _defaults() -> Dict[str, Any]:
+    return {
         "text":None, "source_file":None, "parsed":False,
         "doc_type":None, "law_name":None, "result":None, "chunks":[], "issues":[],
         "strict_lossless":True, "split_long_articles":True,
         "split_threshold_chars":1500, "tail_merge_min_chars":200, "overlap_chars":200,
         "bracket_front_matter":True, "bracket_headnotes":True,
-        "use_llm_summary":True, "llm_errors":[], "report_json_str":"", "chunks_jsonl_rich":"", "chunks_jsonl_flat":"",
-        # LLM 성능/비용 옵션
-        "skip_short_chars":180,
-        "batch_group_size":8,
-        "parallel_calls":3,
-        "max_calls":0,
-        "llm_cache":{}
+        # fallback-only knobs
+        "fallback_enable": True,
+        "fallback_target_chars": 1200,
+        "fallback_min_ratio": 0.40,   # min_chars = target * this
+        "fallback_second_cut": True,
+        # LLM options
+        "use_llm_summary":True, "skip_short_chars":180, "batch_group_size":8, "parallel_calls":3, "max_calls":0,
+        "llm_cache":{}, "llm_errors":[],
+        # outputs (strings)
+        "report_json_str":"", "chunks_jsonl_rich":"", "chunks_jsonl_flat":"",
+        # UI
+        "upload_key": str(random.random()),
     }
-    for k,v in defaults.items(): st.session_state.setdefault(k,v)
+
+def _ensure_state():
+    for k,v in _defaults().items():
+        st.session_state.setdefault(k,v)
+
+def _reset_all():
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.session_state.update(_defaults())
+    st.rerun()
 
 class RunPanel:
     def __init__(self):
         with st.sidebar:
-            st.header("진행 상황")
-            self.status = st.status("대기 중...", expanded=True)
-            self.prog = st.progress(0, text="대기 중")
+            st.header("Progress")
+            self.status = st.status("Idle...", expanded=True)
+            self.prog = st.progress(0, text="Idle")
             self.lines = st.container()
         self.t0 = time.time(); self.done=0
     def _update(self, label, inc=None, set_to=None):
@@ -403,78 +484,111 @@ class RunPanel:
         with self.lines: st.markdown(f"- {text}")
     def tick(self, label, inc): self._update(label, inc=inc)
     def finalize(self, ok=True):
-        self.status.update(label=f"완료 · {time.time()-self.t0:.1f}s", state=("complete" if ok else "error"))
-        self._update("완료", set_to=100)
+        self.status.update(label=f"Done · {time.time()-self.t0:.1f}s", state=("complete" if ok else "error"))
+        self._update("Done", set_to=100)
 
-# ---------- 메인 ----------
+# ----------------------- Main -----------------------
 def main():
     _inject_css(); _ensure_state()
     st.title(APP_TITLE)
 
-    up = st.file_uploader("텍스트 파일 업로드 (.txt, UTF-8)", type=["txt"])
-    with st.container():
-        st.markdown('<div class="parse-line">', unsafe_allow_html=True)
-        run = st.button("파싱", key="parse_btn_top"); st.markdown('</div>', unsafe_allow_html=True)
+    # Top action row: New File + Parse
+    st.markdown('<div class="parse-line">', unsafe_allow_html=True)
+    new_file = st.button("New File", key="btn_new", type="secondary")
+    parse_btn = st.button("Parse", key="parse_btn_top")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    # 옵션
+    if new_file:
+        _reset_all()
+        return
+
+    # File uploader (resettable via key)
+    up = st.file_uploader("Upload a text file (.txt, UTF-8)", type=["txt"], key=st.session_state["upload_key"])
+
+    # Options — Chunking
+    st.subheader("Chunking Options")
     r1,r2,r3 = st.columns(3)
-    with r1: st.session_state["split_threshold_chars"]=st.number_input("분할 임계값(문자)",600,6000,st.session_state["split_threshold_chars"],100)
-    with r2: st.session_state["tail_merge_min_chars"]=st.number_input("tail 병합 최소 길이(문자)",0,600,st.session_state["tail_merge_min_chars"],10)
-    with r3: st.session_state["overlap_chars"]=st.number_input("오버랩(문맥) 길이",0,800,st.session_state["overlap_chars"],25)
+    with r1:
+        st.session_state["split_threshold_chars"]=st.number_input("Split threshold (chars)",600,6000,st.session_state["split_threshold_chars"],100)
+    with r2:
+        st.session_state["tail_merge_min_chars"]=st.number_input("Tail merge min length",0,600,st.session_state["tail_merge_min_chars"],10)
+    with r3:
+        st.session_state["overlap_chars"]=st.number_input("Overlap (context) length",0,800,st.session_state["overlap_chars"],25)
 
     o1,o2,o3 = st.columns(3)
-    with o1: st.session_state["strict_lossless"]=st.checkbox("Strict 무손실", value=st.session_state["strict_lossless"])
-    with o2: st.session_state["split_long_articles"]=st.checkbox("롱 조문 분할", value=st.session_state["split_long_articles"])
+    with o1:
+        st.session_state["strict_lossless"]=st.checkbox("Strict lossless", value=st.session_state["strict_lossless"])
+    with o2:
+        st.session_state["split_long_articles"]=st.checkbox("Split extra-long articles", value=st.session_state["split_long_articles"])
     with o3:
-        st.session_state["bracket_front_matter"]=st.checkbox("Front matter도 표시", value=st.session_state["bracket_front_matter"])
-        st.session_state["bracket_headnotes"]=st.checkbox("Headnote(ส่วน/หมวด 등) 표시", value=st.session_state["bracket_headnotes"])
+        st.session_state["bracket_front_matter"]=st.checkbox("Show front matter", value=st.session_state["bracket_front_matter"])
+        st.session_state["bracket_headnotes"]=st.checkbox("Show headnotes (หมวด/ส่วน/etc.)", value=st.session_state["bracket_headnotes"])
+
+    # Fallback-only knobs
+    st.subheader("Structure-free Fallback (for structureless docs)")
+    f1,f2,f3,f4 = st.columns(4)
+    with f1:
+        st.session_state["fallback_enable"]=st.checkbox("Enable fallback", value=st.session_state["fallback_enable"])
+    with f2:
+        st.session_state["fallback_target_chars"]=st.number_input("Fallback target (chars)", 800, 2400, st.session_state["fallback_target_chars"], 50)
+    with f3:
+        st.session_state["fallback_min_ratio"]=st.number_input("Fallback min ratio", 0.20, 0.80, st.session_state["fallback_min_ratio"], 0.05, format="%.2f")
+    with f4:
+        st.session_state["fallback_second_cut"]=st.checkbox("Enable second-cut hints", value=st.session_state["fallback_second_cut"])
 
     st.divider()
-    st.subheader("LLM 속도/비용 옵션")
+    st.subheader("LLM (Batch+Cache) Options")
     c1,c2,c3,c4 = st.columns(4)
-    with c1: st.session_state["skip_short_chars"]=st.number_input("LLM 스킵 임계(문자)", 60, 600, st.session_state["skip_short_chars"], 10)
-    with c2: st.session_state["batch_group_size"]=st.number_input("배치 그룹 크기(개)", 2, 20, st.session_state["batch_group_size"], 1)
-    with c3: st.session_state["parallel_calls"]=st.number_input("동시 배치 호출", 1, 8, st.session_state["parallel_calls"], 1)
-    with c4: st.session_state["max_calls"]=st.number_input("최대 배치 호출 수(0=무제한)", 0, 9999, st.session_state["max_calls"], 1)
+    with c1:
+        st.session_state["skip_short_chars"]=st.number_input("Skip if core ≤ chars", 60, 600, st.session_state["skip_short_chars"], 10)
+    with c2:
+        st.session_state["batch_group_size"]=st.number_input("Batch group size", 2, 20, st.session_state["batch_group_size"], 1)
+    with c3:
+        st.session_state["parallel_calls"]=st.number_input("Parallel batches", 1, 8, st.session_state["parallel_calls"], 1)
+    with c4:
+        st.session_state["max_calls"]=st.number_input("Max batch calls (0=unlimited)", 0, 9999, st.session_state["max_calls"], 1)
 
-    st.session_state["use_llm_summary"]=st.checkbox("LLM 요약 생성(배치+캐시)", value=True)
+    st.session_state["use_llm_summary"]=st.checkbox("Generate summaries with LLM", value=st.session_state["use_llm_summary"])
 
+    # Load file content
     if up is not None:
         try:
             st.session_state["text"]=up.read().decode("utf-8")
             st.session_state["source_file"]=up.name
         except UnicodeDecodeError:
-            st.error("UTF-8로 저장된 .txt를 업로드하세요."); return
+            st.error("Please upload a UTF-8 encoded .txt file.")
+            return
 
-    if run:
+    if parse_btn:
         if not st.session_state["text"]:
-            st.warning("먼저 파일을 업로드하세요."); return
+            st.warning("Please upload a file first.")
+            return
 
         panel = RunPanel()
         try:
             text = st.session_state["text"]; src = st.session_state["source_file"]
 
-            # 1) 파싱
-            panel.step("1/6 파싱")
+            # 1) Parse
+            panel.step("1/6 Parse")
             t0 = time.time()
             doc_type = detect_doc_type(text)
             result: ParseResult = parse_document(text, doc_type=doc_type)
-            panel.log(f"파싱 완료 · {time.time()-t0:.2f}s, doc_type={doc_type}")
-            panel.tick("파싱", inc=18)
+            panel.log(f"Parsing finished · {time.time()-t0:.2f}s, doc_type={doc_type}")
+            panel.tick("Parse", inc=18)
 
-            # 2) 수복/검증
-            panel.step("2/6 트리 수복/검증")
+            # 2) Repair / Validate
+            panel.step("2/6 Tree repair & validate")
             t0 = time.time()
             issues_before = validate_tree(result)
             rep_diag = repair_tree(result)
             issues_after = validate_tree(result)
-            panel.log(f"수복 전 이슈={len(issues_before)} → 후={len(issues_after)} · {time.time()-t0:.2f}s")
-            panel.tick("트리 수복", inc=12)
+            panel.log(f"Issues before={len(issues_before)} → after={len(issues_after)} · {time.time()-t0:.2f}s")
+            panel.tick("Tree repair", inc=12)
 
-            # 3) 청킹
-            panel.step("3/6 청킹")
+            # 3) Chunking
+            panel.step("3/6 Chunking")
             t0 = time.time()
-            base_law = guess_law_name(text)
+            base_law = _normalize_law_name(guess_law_name(text), src or "document.txt")
             chunks, mk_diag = make_chunks(
                 result=result, mode="article_only", source_file=src, law_name=base_law,
                 include_front_matter=True, include_headnotes=True, include_gap_fallback=True,
@@ -486,78 +600,72 @@ def main():
                 overlap_chars=st.session_state["overlap_chars"],
                 soft_cut=True
             )
-            panel.log(f"청크 1차 생성 {len(chunks)}개 · {time.time()-t0:.2f}s")
+            mode = "structured"
+            panel.log(f"Initial chunks: {len(chunks)} · {time.time()-t0:.2f}s")
 
-            # === 구조-프리 Fallback: 기사/헤드가 전혀 없고 gap만 있을 때만 작동 ===
+            # 3a) Structure-free fallback (only if no articles and single big gap)
             arts = [c for c in chunks if (c.meta or {}).get("type") in ("article","article_pack")]
             gaps  = [c for c in chunks if (c.meta or {}).get("type") == "gap_fallback"]
-            if len(arts)==0 and len(gaps)==1:
-                panel.log("구조-프리 Fallback 작동: 단락/길이 기반 청킹으로 대체")
+            if st.session_state["fallback_enable"] and len(arts)==0 and len(gaps)==1:
+                panel.log("Structure-free fallback triggered: paragraph+length")
                 fallback_chunks, fb_diag = make_generic_chunks(
                     full_text=result.full_text,
                     law_name=base_law or "",
                     source_file=src or "",
-                    target_chars=st.session_state["split_threshold_chars"],
-                    min_chars=max(300, int(st.session_state["split_threshold_chars"]*0.45)),
+                    target_chars=st.session_state["fallback_target_chars"],
+                    min_ratio=st.session_state["fallback_min_ratio"],
                     overlap_chars=st.session_state["overlap_chars"],
-                    tail_merge_min_chars=st.session_state["tail_merge_min_chars"]
+                    tail_merge_min_chars=st.session_state["tail_merge_min_chars"],
+                    enable_second_cut=st.session_state["fallback_second_cut"]
                 )
                 chunks = fallback_chunks
+                mode = "fallback"
                 if isinstance(mk_diag, dict):
                     mk_diag["generic_fallback"] = fb_diag
-                panel.log(f"Fallback 생성 청크 {len(chunks)}개")
+                panel.log(f"Fallback chunks: {len(chunks)}")
 
-            # 3.5) 꼬리 병합(일반 문서에서도 적용)
+            # 3b) Tail sweep
             tail_threshold = st.session_state["tail_merge_min_chars"]
             sweep_diag = merge_small_trailing_parts(chunks, full_text=result.full_text, max_tail_chars=tail_threshold)
             if isinstance(mk_diag, dict):
                 mk_diag["micro_sweeper_tail"] = {"max_tail_chars": tail_threshold, **sweep_diag}
-            panel.log(f"마이크로 스위퍼 적용 · merged={sweep_diag.get('merged_count',0)}")
+            panel.log(f"Micro sweeper · merged={sweep_diag.get('merged_count',0)}")
 
-            # 3.6) 번호머리 경계 스냅(쌍 단위)
-            enum_diag = normalize_enumeration_boundaries(chunks, full_text=result.full_text)
-            if isinstance(mk_diag, dict):
-                mk_diag["enum_boundary"] = enum_diag
-            panel.log(f"경계 스냅 · pairs={enum_diag['pairs_seen']}, hits={enum_diag['hits']}")
+            # 3c) Enumeration boundary snap (pairwise) + label reconciliation
+            enum_diag = normalize_enumeration_boundaries(chunks, full_text=result.full_text, reconcile_labels=True)
+            panel.log(f"Anchor snap · pairs={enum_diag['pairs_seen']}, hits={enum_diag['hits']}, label_fixes={enum_diag['label_mismatch_fixed']}")
 
-            # 3.7) 0-길이/틈 정리
+            # 3d) Zero-length & gaps cleanup
             zero_diag = fix_zero_length_and_gaps(chunks, full_text=result.full_text)
-            if isinstance(mk_diag, dict):
-                mk_diag["zero_cleanup"] = {k:v for k,v in zero_diag.items() if k!="removed_labels"}
-            panel.log(f"0-길이 정리 · removed={zero_diag['removed_zero_span']}, fixed_next_start={zero_diag['fixed_next_start']}")
+            panel.log(f"Zero-length cleanup · removed={zero_diag['removed_zero_span']}, fixed_next_start={zero_diag['fixed_next_start']}")
 
-            # 하드캡 진단
+            # hard-cap check (diagnostic)
             hard_cap = st.session_state["split_threshold_chars"] + 2*st.session_state["overlap_chars"] + 120
             cap_viol = [{"label": (c.meta or {}).get("section_label",""), "len": (int(c.span_end) - int(c.span_start))}
                         for c in chunks if (int(c.span_end) - int(c.span_start)) > hard_cap]
             if isinstance(mk_diag, dict):
+                mk_diag["enum_boundary"] = enum_diag
+                mk_diag["zero_cleanup"] = {k:v for k,v in zero_diag.items() if k!="removed_labels"}
                 mk_diag["hard_cap"] = {"cap_chars": hard_cap, "violations": cap_viol, "count": len(cap_viol)}
 
             arts = [c for c in chunks if (c.meta or {}).get("type") in ("article","article_pack")]
-            panel.log(f"현재 청크 {len(chunks)}개 (article {len(arts)})")
-            panel.tick("청킹", inc=20)
+            panel.log(f"Total chunks now: {len(chunks)} (article-like {len(arts)})")
+            panel.tick("Chunking", inc=20)
 
-            # 4) LLM 요약 (배치+캐시+스킵) — 사용량/시간 누적 통계
+            # 4) LLM summaries (batch+cache+skip)
             llm_errors: List[str] = []
             cache: Dict[str, Any] = st.session_state["llm_cache"]
             skip_short = st.session_state["skip_short_chars"]
 
             stats = {
-                "model": None,
-                "batches": 0,
-                "sections_total": len(arts),
-                "sections_cache_hits": 0,
-                "sections_local_skip": 0,
-                "sections_new_calls": 0,
-                "usage_prompt_tokens": 0,
-                "usage_completion_tokens": 0,
-                "usage_total_tokens": 0,
-                "elapsed_ms_sum": 0,
-                "est_cost_usd": 0.0,
+                "model": None, "batches": 0, "sections_total": len(arts),
+                "sections_cache_hits": 0, "sections_local_skip": 0, "sections_new_calls": 0,
+                "usage_prompt_tokens": 0, "usage_completion_tokens": 0, "usage_total_tokens": 0,
+                "elapsed_ms_sum": 0, "est_cost_usd": 0.0,
             }
 
             if st.session_state["use_llm_summary"] and len(arts)>0:
-                panel.step("4/6 LLM 요약(배치)")
+                panel.step("4/6 LLM batch summarization")
                 pending = []
                 for idx, c in enumerate(arts, 1):
                     cs,ce = (c.meta or {}).get("core_span",[int(c.span_start), int(c.span_end)])
@@ -592,12 +700,12 @@ def main():
                     pending.append((f"A{idx:04d}", c, core))
 
                 stats["sections_new_calls"] = len(pending)
-                panel.log(f"스킵/캐시 적용 · cache {stats['sections_cache_hits']} / local-skip {stats['sections_local_skip']} / 대기 {len(pending)}")
+                panel.log(f"Skip/Cache applied · cache {stats['sections_cache_hits']} / local-skip {stats['sections_local_skip']} / pending {len(pending)}")
 
                 total_batches = math.ceil(len(pending) / st.session_state["batch_group_size"])
                 if st.session_state["max_calls"] and total_batches > st.session_state["max_calls"]:
                     total_batches = st.session_state["max_calls"]
-                panel.log(f"배치 호출 예정: {total_batches}개")
+                panel.log(f"Planned batch calls: {total_batches}")
 
                 def _run_batch(batch_items):
                     sections = [{"id": bid, "title": (ch.meta or {}).get("section_label",""),
@@ -650,51 +758,45 @@ def main():
                                 cache[_sha1(core)] = {"text": txt, "rec": rec}
 
                 st.session_state["llm_cache"]=cache
-                panel.tick("LLM 요약", inc=30)
+                panel.tick("LLM summarize", inc=30)
             else:
                 if len(arts)==0:
-                    panel.log("LLM 요약: article 없음 → 생략")
+                    panel.log("LLM summarization skipped: no article-like chunks")
                 else:
-                    panel.log("LLM 요약: 비활성화 (로컬 규칙만)")
-                stats = {
-                    "model": None, "batches": 0,
-                    "sections_total": len(arts),
-                    "sections_cache_hits": 0,
-                    "sections_local_skip": len(arts) if len(arts)>0 else 0,
-                    "sections_new_calls": 0,
-                    "usage_prompt_tokens": 0,
-                    "usage_completion_tokens": 0,
-                    "usage_total_tokens": 0,
-                    "elapsed_ms_sum": 0,
-                    "est_cost_usd": 0.0,
-                }
+                    panel.log("LLM summarization disabled")
+                # keep empty stats structure
 
             st.session_state["llm_errors"] = llm_errors
 
-            # 파생지표
+            # Derived stats
             def _safe_div(a, b): return (a / b) if (b and b != 0) else 0.0
             derived = {
-                "avg_tokens_per_section": round(_safe_div(stats["usage_total_tokens"], max(1, stats["sections_new_calls"])), 2),
-                "avg_ms_per_batch": round(_safe_div(stats["elapsed_ms_sum"], max(1, stats["batches"])), 2),
-                "sections_per_second": round(_safe_div(stats["sections_new_calls"], stats["elapsed_ms_sum"]/1000.0 if stats["elapsed_ms_sum"] else 0), 3),
+                "avg_tokens_per_section": round(_safe_div(stats["usage_total_tokens"], max(1, stats.get("sections_new_calls",0))), 2),
+                "avg_ms_per_batch": round(_safe_div(stats["elapsed_ms_sum"], max(1, stats.get("batches",0))), 2),
+                "sections_per_second": round(_safe_div(stats.get("sections_new_calls",0), stats["elapsed_ms_sum"]/1000.0 if stats["elapsed_ms_sum"] else 0), 3) if stats.get("sections_new_calls",0) else 0.0,
                 "effective_unit_cost_per_1k": round(_safe_div(stats["est_cost_usd"], (stats["usage_total_tokens"]/1000.0) if stats["usage_total_tokens"] else 0), 6) if stats["usage_total_tokens"] else None,
                 "pricing_source": "derived_effective"
             }
             stats.update({"derived": derived})
 
-            # 5) REPORT/저장
-            panel.step("5/6 리포트/저장")
+            # 5) Report / export
+            panel.step("5/6 Report & export")
             cov=_coverage(chunks, len(result.full_text))
             report_str = make_debug_report(
                 parse_result=result, chunks=chunks, source_file=src, law_name=base_law or "",
                 run_config={
+                    "mode": mode,  # <— structured | fallback
                     "strict_lossless":st.session_state["strict_lossless"],
                     "split_long_articles":st.session_state["split_long_articles"],
                     "split_threshold_chars":st.session_state["split_threshold_chars"],
                     "tail_merge_min_chars":st.session_state["tail_merge_min_chars"],
                     "overlap_chars":st.session_state["overlap_chars"],
-                    "bracket_front_matter":st.session_state["bracket_front_matter"],
-                    "bracket_headnotes":st.session_state["bracket_headnotes"],
+                    "fallback_enable":st.session_state["fallback_enable"],
+                    "fallback_target_chars":st.session_state["fallback_target_chars"],
+                    "fallback_min_ratio":st.session_state["fallback_min_ratio"],
+                    "fallback_second_cut":st.session_state["fallback_second_cut"],
+                    "show_front_matter":st.session_state["bracket_front_matter"],
+                    "show_headnotes":st.session_state["bracket_headnotes"],
                     "use_llm_summary":st.session_state["use_llm_summary"],
                     "batch_group_size":st.session_state["batch_group_size"],
                     "parallel_calls":st.session_state["parallel_calls"],
@@ -717,45 +819,55 @@ def main():
                 "issues":issues_after, "report_json_str":report_str,
                 "chunks_jsonl_rich":jsonl_rich, "chunks_jsonl_flat":jsonl_flat
             })
-            panel.tick("리포트/저장", inc=10)
+            panel.tick("Report/export", inc=10)
 
-            # 6) 렌더
-            panel.step("6/6 렌더")
+            # 6) Render
+            panel.step("6/6 Render")
             panel.finalize(ok=True)
 
         except Exception as e:
-            panel.log(f"❌ 오류: {type(e).__name__}: {e}")
+            panel.log(f"❌ Error: {type(e).__name__}: {e}")
             panel.finalize(ok=False)
             raise
 
-    # ---------- 표시/다운로드 ----------
+    # ----------------------- Display & downloads -----------------------
     if st.session_state["parsed"]:
         cov=_coverage(st.session_state["chunks"], len(st.session_state["result"].full_text))
         arts=[c for c in st.session_state["chunks"] if (c.meta or {}).get("type") in ("article","article_pack")]
         st.write(
-            f"**파일:** {st.session_state['source_file']}  |  "
+            f"**File:** {st.session_state['source_file']}  |  "
             f"**doc_type:** {st.session_state.get('doc_type','unknown')}  |  "
             f"**law_name:** {st.session_state.get('law_name') or 'N/A'}  |  "
-            f"**chunks:** {len(st.session_state['chunks'])} (article {len(arts)})  |  "
+            f"**chunks:** {len(st.session_state['chunks'])} (article-like {len(arts)})  |  "
             f"**coverage:** {cov:.6f}"
         )
 
         if st.session_state["llm_errors"]:
-            st.markdown(f'<span class="badge-warn">LLM 실패 {len(st.session_state["llm_errors"])}건</span>', unsafe_allow_html=True)
-            with st.expander("LLM 실패 사유 보기"):
+            st.markdown(f'<span class="badge-warn">LLM failures {len(st.session_state["llm_errors"])} items</span>', unsafe_allow_html=True)
+            with st.expander("Show LLM failure reasons"):
                 for e in st.session_state["llm_errors"]:
                     st.code(e)
 
+        base = _basename_no_ext(st.session_state['source_file'] or "document")
+        rich_bytes = st.session_state["chunks_jsonl_rich"].encode("utf-8")
+        flat_bytes = st.session_state["chunks_jsonl_flat"].encode("utf-8")
+        report_bytes = st.session_state["report_json_str"].encode("utf-8")
+
+        # One-click ZIP
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{base}_chunks_rich.jsonl", rich_bytes)
+            zf.writestr(f"{base}_chunks_compat.jsonl", flat_bytes)
+            zf.writestr(f"{base}_REPORT.json", report_bytes)
+        zip_buf.seek(0)
+
         st.markdown('<div class="dlbar">', unsafe_allow_html=True)
-        st.download_button("JSONL 다운로드 — Rich Meta", st.session_state["chunks_jsonl_rich"].encode("utf-8"),
-                           file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks_rich.jsonl",
-                           mime="application/json", key="dl-jsonl-rich")
-        st.download_button("JSONL 다운로드 — Compat Flat", st.session_state["chunks_jsonl_flat"].encode("utf-8"),
-                           file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_chunks_compat.jsonl",
-                           mime="application/json", key="dl-jsonl-flat")
-        st.download_button("DEBUG 다운로드 (REPORT.json)", st.session_state["report_json_str"].encode("utf-8"),
-                           file_name=f"{st.session_state['source_file'].rsplit('.',1)[0]}_REPORT.json",
-                           mime="application/json", key="dl-report-bottom")
+        st.download_button("Download All (ZIP)", data=zip_buf, file_name=f"{base}_ALL.zip", mime="application/zip", key="dl-all-zip")
+        # Optional: still offer individual downloads
+        st.download_button("Download — Rich JSONL", rich_bytes, file_name=f"{base}_chunks_rich.jsonl", mime="application/json", key="dl-jsonl-rich")
+        st.download_button("Download — Compat JSONL", flat_bytes, file_name=f"{base}_chunks_compat.jsonl", mime="application/json", key="dl-jsonl-flat")
+        st.download_button("Download — REPORT.json", report_bytes, file_name=f"{base}_REPORT.json", mime="application/json", key="dl-report-json")
+        st.markdown('</div>', unsafe_allow_html=True)
 
         html = render_with_overlap(
             text=st.session_state["result"].full_text,
@@ -765,8 +877,8 @@ def main():
         )
         st.markdown('<div class="docwrap">'+html+'</div>', unsafe_allow_html=True)
     else:
-        st.info("파일을 올린 뒤 **[파싱]** 버튼을 눌러주세요.")
-        st.caption("사이드바 ‘진행 상황’ 패널에서 단계별 진행률을 확인할 수 있습니다.")
+        st.info("Upload a file and click **Parse**.")
+        st.caption("Use the sidebar to follow each step's progress and logs.")
 
 if __name__ == "__main__":
     main()
