@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
-import time, json, math
+import time, json, math, os, sys
 from typing import List, Dict, Any, Tuple
 import streamlit as st
+
+# --- 경로 보정: 현재 파일 디렉토리를 sys.path에 추가 (Streamlit Cloud 대비) ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
 
 # 파서/후처리
 from parser_core.parser import detect_doc_type, parse_document
@@ -11,10 +16,15 @@ from parser_core.postprocess import (
 )
 from parser_core.schema import ParseResult, Chunk
 
-# 익스포트 (경로 교정)
-from writers import (
-    to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
-)
+# 익스포트 (writers 위치 호환: 루트 writers.py 또는 exporters/writers.py)
+try:
+    from writers import (
+        to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
+    )
+except ModuleNotFoundError:
+    from exporters.writers import (
+        to_jsonl_rich_meta, to_jsonl_compat_flat, make_debug_report
+    )
 
 # LLM (요약 배치/캐시)
 from llm_clients import call_openai_batch
@@ -81,7 +91,6 @@ def _esc(s:str)->str:
     return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 def _brief_fallback(chunk: Chunk, full_text: str, max_len: int = 180) -> str:
-    # meta.brief 없을 때 core_span으로 로컬 규칙 요약 생성
     s, e = chunk.meta.get("core_span",[chunk.span_start, chunk.span_end])
     if not (isinstance(s,int) and isinstance(e,int) and e>s): s,e = chunk.span_start, chunk.span_end
     core = full_text[s:e].strip()
@@ -128,7 +137,6 @@ def render_with_overlap(text: str, chunks: List[Chunk], *, include_front=True, i
         parts.append("</span>")
         idx+=1
 
-        # 요약: meta.brief가 있으면 사용, 없으면 로컬 규칙 요약 fallback
         brief = (c.meta or {}).get("brief") or _brief_fallback(c, text, 180)
         tail = f' }} chunk {idx:04d}'
         if brief:
@@ -206,7 +214,8 @@ def main():
         if not st.session_state["text"]:
             st.warning("먼저 파일을 업로드하세요."); return
 
-        panel = RunPanel()
+        class RunPanelCtx(RunPanel): pass
+        panel = RunPanelCtx()
         try:
             text = st.session_state["text"]; src = st.session_state["source_file"]
 
@@ -251,7 +260,7 @@ def main():
                 mk_diag["micro_sweeper_tail"] = {"max_tail_chars": tail_threshold, **sweep_diag}
             panel.log(f"마이크로 스위퍼 적용 · merged={sweep_diag['merged_count']}")
 
-            # 하드캡 진단(진단용: 분할 임계 + 2*overlap + 120 슬랙)
+            # 하드캡 진단(분할 임계 + 2*overlap + 슬랙)
             hard_cap = st.session_state["split_threshold_chars"] + 2*st.session_state["overlap_chars"] + 120
             cap_viol = [{"label": (c.meta or {}).get("section_label",""), "len": (c.span_end - c.span_start)}
                         for c in chunks if (c.span_end - c.span_start) > hard_cap]
